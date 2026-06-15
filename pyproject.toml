@@ -1,0 +1,37 @@
+[project]
+name = "metal-indextts2"
+version = "0.1.0"
+description = "Apple Silicon pure Metal runtime scaffold and tooling for IndexTTS2"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+torch = [
+  "torch",
+  "torchaudio",
+  "pyyaml",
+]
+dev = [
+  "pytest>=8",
+]
+
+[project.scripts]
+mit2-profile-baseline = "metal_indextts2.tools.profile_baseline:main"
+mit2-generate-golden = "metal_indextts2.tools.generate_golden:main"
+mit2-generate-campplus-golden = "metal_indextts2.tools.generate_campplus_golden:main"
+mit2-compare-golden = "metal_indextts2.tools.compare_golden:main"
+mit2-convert-model = "metal_indextts2.tools.convert_model:main"
+mit2-convert-voice = "metal_indextts2.tools.convert_voice:main"
+mit2-export-voice-pt = "metal_indextts2.tools.export_voice_pt:main"
+mit2-inspect-clone-quality = "metal_indextts2.tools.inspect_clone_quality:main"
+mit2-synthesize-reference = "metal_indextts2.tools.synthesize_reference:main"
+mit2-extract-w2v-features = "metal_indextts2.tools.extract_w2v_features:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["metal_indextts2*"]

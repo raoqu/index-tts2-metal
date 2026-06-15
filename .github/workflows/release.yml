@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-arm64:
+    name: Build macOS arm64
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify runner architecture
+        run: |
+          uname -a
+          test "$(uname -m)" = "arm64"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+
+      - name: Build
+        run: cmake --build build --target mtts --parallel "$(sysctl -n hw.ncpu)"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME:-manual}"
+          package_dir="index-tts2-metal-${version}-macos-arm64"
+          asset="${package_dir}.tar.gz"
+
+          mkdir -p "dist/${package_dir}"
+          cp build/mtts "dist/${package_dir}/mtts"
+          cp README.md README.zh.md "dist/${package_dir}/"
+          chmod +x "dist/${package_dir}/mtts"
+
+          tar -C dist -czf "dist/${asset}" "${package_dir}"
+          shasum -a 256 "dist/${asset}" > "dist/${asset}.sha256"
+
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/*.tar.gz dist/*.sha256 --clobber
+          else
+            gh release create "${tag}" dist/*.tar.gz dist/*.sha256 \
+              --title "${tag}" \
+              --generate-notes
+          fi

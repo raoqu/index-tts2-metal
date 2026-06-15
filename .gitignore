@@ -1,0 +1,15 @@
+build/
+artifacts/
+sample/
+bundle/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.DS_Store
+output*.wav*
+model/
+bin/
+*.log
+*.wav*
+voices/
+*.zip

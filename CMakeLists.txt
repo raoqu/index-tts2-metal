@@ -10,34 +10,47 @@ set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 # Text-frontend dependencies: SentencePiece (BPE) + kaldifst (OpenFST engine
 # for the wetext text-normalization grammars). These give the native runtime a
 # full, faithful tokenizer matching the reference IndexTTS2 Python frontend.
+#
+# The sources are vendored under third_party/ (sentencepiece v0.2.0,
+# kaldifst v1.7.17, openfst sherpa-onnx-2024-06-13 already patched by kaldifst)
+# so the build needs NO network access. See third_party/README.md.
 # ---------------------------------------------------------------------------
-include(FetchContent)
-# OpenFST (vendored by kaldifst) ships a pre-3.10 cmake_minimum_required; allow it.
+# OpenFST ships a pre-3.10 cmake_minimum_required; allow it for the subbuilds.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+set(MIT2_TP ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
+# --- SentencePiece (static lib, bundled abseil, no network) ---
 set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
 set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(sentencepiece
-  GIT_REPOSITORY https://github.com/google/sentencepiece.git
-  GIT_TAG v0.2.0)
-FetchContent_MakeAvailable(sentencepiece)
+set(SPM_ABSL_PROVIDER "internal" CACHE STRING "" FORCE)
+add_subdirectory(${MIT2_TP}/sentencepiece ${CMAKE_BINARY_DIR}/sentencepiece-build EXCLUDE_FROM_ALL)
 
-# kaldifst's CMake appends ${CMAKE_SOURCE_DIR}/cmake to CMAKE_MODULE_PATH and
-# sets kaldifst_core's include dir to ${CMAKE_SOURCE_DIR}, both wrong under
-# FetchContent. Populate manually, fix the module path, then add_subdirectory
-# and repair the include dir.
-set(KALDIFST_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
-set(KALDIFST_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(kaldifst
-  GIT_REPOSITORY https://github.com/k2-fsa/kaldifst.git
-  GIT_TAG v1.7.17)
-FetchContent_GetProperties(kaldifst)
-if(NOT kaldifst_POPULATED)
-  FetchContent_Populate(kaldifst)
-  list(APPEND CMAKE_MODULE_PATH ${kaldifst_SOURCE_DIR}/cmake ${kaldifst_SOURCE_DIR}/cmake/Modules)
-  add_subdirectory(${kaldifst_SOURCE_DIR} ${kaldifst_BINARY_DIR})
-  target_include_directories(kaldifst_core PUBLIC ${kaldifst_SOURCE_DIR})
-endif()
+# --- OpenFST (disable every extension; only the core `fst` lib is needed) ---
+foreach(_fst_opt HAVE_BIN HAVE_COMPACT HAVE_COMPRESS HAVE_CONST HAVE_FAR HAVE_GRM
+                 HAVE_PDT HAVE_MPDT HAVE_LINEAR HAVE_LOOKAHEAD HAVE_NGRAM
+                 HAVE_PYTHON HAVE_SPECIAL)
+  set(${_fst_opt} OFF CACHE BOOL "" FORCE)
+endforeach()
+set(HAVE_SCRIPT ON CACHE BOOL "" FORCE)
+add_subdirectory(${MIT2_TP}/openfst ${CMAKE_BINARY_DIR}/openfst-build EXCLUDE_FROM_ALL)
+
+# --- kaldifst_core (text normalizer): built directly from the vendored sources,
+#     bypassing kaldifst's own CMake (which downloads openfst via FetchContent). ---
+set(KALDIFST_CSRC ${MIT2_TP}/kaldifst/kaldifst/csrc)
+add_library(kaldifst_core STATIC
+  ${KALDIFST_CSRC}/context-fst.cc
+  ${KALDIFST_CSRC}/kaldi-fst-io.cc
+  ${KALDIFST_CSRC}/kaldi-holder.cc
+  ${KALDIFST_CSRC}/kaldi-io.cc
+  ${KALDIFST_CSRC}/kaldi-math.cc
+  ${KALDIFST_CSRC}/kaldi-semaphore.cc
+  ${KALDIFST_CSRC}/kaldi-table.cc
+  ${KALDIFST_CSRC}/parse-options.cc
+  ${KALDIFST_CSRC}/text-normalizer.cc
+  ${KALDIFST_CSRC}/text-utils.cc)
+target_include_directories(kaldifst_core PUBLIC ${MIT2_TP}/kaldifst ${MIT2_TP}/openfst/src/include)
+target_link_libraries(kaldifst_core PUBLIC fst)
+target_compile_options(kaldifst_core PRIVATE -w)
 
 # Embed the Metal kernel source into the binary so it has no runtime
 # dependency on metal/kernels.metal.
@@ -73,9 +86,9 @@ set_source_files_properties(${METAL_EMBED_HEADER} PROPERTIES HEADER_FILE_ONLY ON
 set_source_files_properties(runtime/metal_context.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 target_include_directories(mtts PRIVATE runtime/include ${CMAKE_CURRENT_BINARY_DIR}/generated
-  ${kaldifst_SOURCE_DIR}
-  ${openfst_SOURCE_DIR}/src/include
-  ${sentencepiece_SOURCE_DIR}/src)
+  ${MIT2_TP}/kaldifst
+  ${MIT2_TP}/openfst/src/include
+  ${MIT2_TP}/sentencepiece/src)
 target_compile_options(mtts PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(mtts PRIVATE MIT2_TTS_LAUNCHER=1)
 target_link_libraries(mtts PRIVATE

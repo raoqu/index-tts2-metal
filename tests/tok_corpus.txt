@@ -1,0 +1,33 @@
+你好
+中文测试
+大家好，欢迎回来。在本视频中，我们将从零开始构建 Rack 系统。
+我们将使用 Fredman 直播中三位嘉宾的真实数据记录：英伟达的 Jensen Yuang、OpenAI 的 Sam Altman 和 Elon Musk。
+这里我们将 rag chunk size 设置为 500，rag overlap 设置为 80，rag top K 设置为 20，rag top N 设置为 5。
+运行命令 `streamlit run app.py`。
+密集结果的权重为 60%，稀疏结果的权重为 40%。
+BM Twenty Five 算法（经典搜索引擎背后的算法）
+我将使用 `Streamlit run app.py` 命令运行它。
+它把伊隆的动机描述为想要控制权，而不是出于对开源的背叛。
+RAG系统回答了这个问题，但看看它漏掉了什么：整个Ilia的视角都被忽略了。
+2026年3月14日发布
+我的邮箱是 test@example.com
+电话12345
+前 20 个融合候选结果由跨编码器 MS Macro Mini LM 进行评分。
+克里斯托弗·诺兰是导演
+约瑟夫·高登-莱维特出演
+hello world this is a test
+The price is $100.50 today
+xuan4 jve2 ying1
+温度是25摄氏度，约77华氏度
+第七阶段，进行最终的质量检测。前 20 个融合候选结果。
+ju2 que4 xun1
+分数是3/4
+现在时间是14:30:45
+价格￥1234.56元
+这是2.5公里的路程
+他得了第1名，超过了99%的人
+序列号No.12345
+房间号是A101
+1=1并且3×4=12
+温度-5℃很冷
+IndexTTS 正式发布1.0版本了，效果666

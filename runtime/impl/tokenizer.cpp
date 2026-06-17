@@ -243,6 +243,19 @@ struct CjkTokenizedSegment {
     std::vector<uint32_t> ids;
 };
 
+// Full native text tokenizer: faithful reimplementation of the reference
+// IndexTTS2 Python frontend (TextNormalizer + SentencePiece), replacing the
+// narrow hand-rolled `tokenize_cjk_text` for arbitrary input. Loads bpe.model
+// and the wetext .fst grammars from <tokenizer_dir> once (process-cached).
+CjkTokenizedText tokenize_text_full(const std::string& tokenizer_dir, const std::string& text) {
+    const mit2::TextFrontend& frontend = mit2::get_cached_text_frontend(tokenizer_dir);
+    mit2::FrontendTokenized t = frontend.tokenize(text);
+    CjkTokenizedText out;
+    out.pieces = std::move(t.pieces);
+    out.ids = std::move(t.ids);
+    return out;
+}
+
 bool is_ascii_alpha(uint32_t cp) {
     return cp < 128 && std::isalpha(static_cast<unsigned char>(cp)) != 0;
 }

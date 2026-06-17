@@ -22,8 +22,7 @@ void print_json_cjk_segments(const std::vector<CjkTokenizedSegment>& segments) {
 bool inspect_tts_cjk_text_readiness(const std::string& bundle_dir, const std::string& text) {
     const std::string tokenizer_dir = bundle_dir + "/tokenizer";
     try {
-        const auto piece_to_id = load_tokenizer_pieces(tokenizer_dir);
-        const auto tokenized = tokenize_cjk_text(piece_to_id, text);
+        const auto tokenized = tokenize_text_full(tokenizer_dir, text);
         const std::vector<TtsCjkPreset> presets{
             resolve_tts_cjk_preset("smoke"),
             resolve_tts_cjk_preset("short"),
@@ -702,8 +701,7 @@ bool inspect_tts_product_readiness(const std::string& bundle_dir, const std::str
     std::string text_error;
     CjkTokenizedText tokenized;
     try {
-        const auto piece_to_id = load_tokenizer_pieces(tokenizer_dir);
-        tokenized = tokenize_cjk_text(piece_to_id, text);
+        tokenized = tokenize_text_full(tokenizer_dir, text);
         text_ok = true;
     } catch (const std::exception& e) {
         text_error = e.what();

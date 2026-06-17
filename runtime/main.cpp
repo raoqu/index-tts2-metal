@@ -1,4 +1,5 @@
 #include "mit2/allocator.hpp"
+#include "mit2/text_frontend.hpp"
 #include "audio.hpp"
 #include <set>
 #include <cstdlib>

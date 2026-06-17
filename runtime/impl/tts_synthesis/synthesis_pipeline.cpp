@@ -1782,8 +1782,7 @@ bool synthesize_hot_text_cjk_seeded_wav(const std::string& bundle_dir,
                                         float cfg_rate,
                                         const std::string& output_wav) {
     const std::string tokenizer_dir = bundle_dir + "/tokenizer";
-    const auto piece_to_id = load_tokenizer_pieces(tokenizer_dir);
-    const auto tokenized = tokenize_cjk_text(piece_to_id, text);
+    const auto tokenized = tokenize_text_full(tokenizer_dir, text);
     return synthesize_hot_text_cjk_tokenized_seeded_wav(bundle_dir,
                                                         voice_bundle_dir,
                                                         text,
@@ -1807,8 +1806,7 @@ bool synthesize_hot_text_cjk_sampled_seeded_wav(const std::string& bundle_dir,
                                                 float cfg_rate,
                                                 const std::string& output_wav) {
     const std::string tokenizer_dir = bundle_dir + "/tokenizer";
-    const auto piece_to_id = load_tokenizer_pieces(tokenizer_dir);
-    const auto tokenized = tokenize_cjk_text(piece_to_id, text);
+    const auto tokenized = tokenize_text_full(tokenizer_dir, text);
     return synthesize_hot_text_cjk_tokenized_seeded_wav(bundle_dir,
                                                         voice_bundle_dir,
                                                         text,
@@ -1879,8 +1877,7 @@ bool synthesize_hot_text_cjk_segments_seeded_wav(const std::string& bundle_dir,
                                                  const std::string& output_wav) {
     const auto started = Clock::now();
     const std::string tokenizer_dir = bundle_dir + "/tokenizer";
-    const auto piece_to_id = load_tokenizer_pieces(tokenizer_dir);
-    const auto tokenized = tokenize_cjk_text(piece_to_id, text);
+    const auto tokenized = tokenize_text_full(tokenizer_dir, text);
     const auto segments = split_cjk_tokenized_text(tokenized, max_text_tokens_per_segment);
     mit2::Bundle voice(voice_bundle_dir);
     const uint32_t requested_prompt_tokens = prompt_tokens;
@@ -1996,8 +1993,7 @@ bool synthesize_hot_text_cjk_segments_sampled_seeded_wav(const std::string& bund
                                                          const std::string& output_wav) {
     const auto started = Clock::now();
     const std::string tokenizer_dir = bundle_dir + "/tokenizer";
-    const auto piece_to_id = load_tokenizer_pieces(tokenizer_dir);
-    const auto tokenized = tokenize_cjk_text(piece_to_id, text);
+    const auto tokenized = tokenize_text_full(tokenizer_dir, text);
     const auto segments = split_cjk_tokenized_text(tokenized, max_text_tokens_per_segment);
     mit2::Bundle voice(voice_bundle_dir);
     const uint32_t requested_prompt_tokens = prompt_tokens;
@@ -2138,8 +2134,7 @@ GptSamplingConfig reference_default_gpt_sampling(uint64_t seed) {
 bool tts_cjk_preset_needs_segments(const std::string& bundle_dir,
                                    const std::string& text,
                                    uint32_t max_text_tokens_per_segment) {
-    const auto piece_to_id = load_tokenizer_pieces(bundle_dir + "/tokenizer");
-    const auto tokenized = tokenize_cjk_text(piece_to_id, text);
+    const auto tokenized = tokenize_text_full(bundle_dir + "/tokenizer", text);
     const auto segments = split_cjk_tokenized_text(tokenized, max_text_tokens_per_segment);
     return segments.size() > 1;
 }

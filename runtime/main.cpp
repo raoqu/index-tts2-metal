@@ -1,6 +1,7 @@
 #include "mit2/allocator.hpp"
 #include "mit2/text_frontend.hpp"
 #include "audio.hpp"
+#include "getmodel.h"
 #include <set>
 #include <cstdlib>
 #include <memory>
@@ -47,6 +48,11 @@ static bool g_cli_verbose = false;
 namespace {
 
 using Clock = std::chrono::steady_clock;
+constexpr const char* kDefaultModelBundleDir = "bin";
+const std::vector<std::string> kModelDownloadUrls = {
+    "https://huggingface.co/raoqu/index-tts2-metal",
+    "https://modelscope.cn/models/iwannaido/index-tts2-metal",
+};
 // Must match the threadgroup scores[] capacity in mit2_dit_attention_qkv_rope*_f32.
 constexpr uint32_t kFusedDitAttentionMaxTokens = 4096;
 constexpr uint32_t kCfmSteps = 25;           // golden tests (goldens were generated at 25)
@@ -80,6 +86,78 @@ inline uint32_t cfm_synthesis_steps() {
 constexpr uint32_t kMaxCodesPerTextToken = 15;
 
 std::string json_escape(const std::string& value);
+
+bool is_help_request(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_default_model_bundle_path(const std::string& path) {
+    std::filesystem::path candidate(path);
+    if (candidate.empty()) {
+        return false;
+    }
+    candidate = candidate.lexically_normal();
+    return candidate == kDefaultModelBundleDir || candidate == std::filesystem::path("./") / kDefaultModelBundleDir;
+}
+
+bool startup_uses_default_model_bundle(int argc, char** argv) {
+    if (argc < 2 || is_help_request(argc, argv)) {
+        return false;
+    }
+
+    if (argv[1][0] != '-') {
+        return is_default_model_bundle_path(argv[1]);
+    }
+
+    bool server_requested = false;
+    std::optional<std::string> explicit_server_model_bundle;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--server" || arg == "--web") {
+            server_requested = true;
+        } else if (arg == "--model_bundle" && i + 1 < argc) {
+            explicit_server_model_bundle = argv[++i];
+        } else if (arg == "--tts" && i + 1 < argc) {
+            return is_default_model_bundle_path(argv[i + 1]);
+        } else if (arg == "--clone" && i + 3 < argc) {
+            return is_default_model_bundle_path(argv[i + 1]);
+        }
+    }
+
+    if (!server_requested) {
+        return false;
+    }
+    if (explicit_server_model_bundle.has_value()) {
+        return is_default_model_bundle_path(*explicit_server_model_bundle);
+    }
+    if (const char* env = std::getenv("MODEL_BUNDLE")) {
+        return is_default_model_bundle_path(env);
+    }
+    return true;
+}
+
+bool default_model_bundle_exists(const std::filesystem::path& model_dir) {
+    return std::filesystem::exists(model_dir / "manifest.json") &&
+           std::filesystem::exists(model_dir / "weights.bin") &&
+           std::filesystem::is_directory(model_dir / "tokenizer");
+}
+
+void ensure_startup_model_downloaded(int argc, char** argv) {
+    if (!startup_uses_default_model_bundle(argc, argv)) {
+        return;
+    }
+    const std::filesystem::path model_dir = kDefaultModelBundleDir;
+    if (default_model_bundle_exists(model_dir)) {
+        return;
+    }
+    DownloadModel(kModelDownloadUrls, model_dir, false);
+}
 
 double seconds_since(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
@@ -4608,6 +4686,13 @@ bool server_run_tts_product_entry(const std::string& command,
 // through as before. Inspection commands (--capabilities, --readiness, ...)
 // keep printing JSON: that output is their machine-readable contract.
 int main(int argc, char** argv) {
+    try {
+        ensure_startup_model_downloaded(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "error: model download failed: " << e.what() << "\n";
+        return 1;
+    }
+
     bool verbose = false;
     bool product_command = false;
     std::vector<char*> args;

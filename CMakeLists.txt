@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD 17)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 
+find_package(CURL REQUIRED)
+
 # ---------------------------------------------------------------------------
 # Text-frontend dependencies: SentencePiece (BPE) + kaldifst (OpenFST engine
 # for the wetext text-normalization grammars). These give the native runtime a
@@ -68,6 +70,7 @@ add_custom_command(
 
 add_executable(mtts
   runtime/main.cpp
+  runtime/getmodel.cpp
   runtime/impl/server.cpp
   runtime/impl/text_frontend.cpp
   runtime/audio.cpp
@@ -93,6 +96,7 @@ target_compile_options(mtts PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(mtts PRIVATE MIT2_TTS_LAUNCHER=1)
 target_link_libraries(mtts PRIVATE
   sqlite3
+  CURL::libcurl
   kaldifst_core
   sentencepiece-static
   "-framework Foundation"

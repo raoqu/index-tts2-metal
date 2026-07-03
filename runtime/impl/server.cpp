@@ -625,6 +625,7 @@ struct VoiceRecord {
     std::string source;
     std::string created_at;
     std::string updated_at;
+    bool locked = false;
 };
 
 struct ConsentRecord {
@@ -653,6 +654,7 @@ public:
              "sample_path TEXT, source_audio_seconds REAL DEFAULT 0, source TEXT,"
              "created_at TEXT, updated_at TEXT, deleted INTEGER DEFAULT 0)");
         exec_ignore_duplicate_column("ALTER TABLE voices ADD COLUMN source_audio_seconds REAL DEFAULT 0");
+        exec_ignore_duplicate_column("ALTER TABLE voices ADD COLUMN locked INTEGER DEFAULT 0");
         exec("CREATE TABLE IF NOT EXISTS voice_consents ("
              "id TEXT PRIMARY KEY, name TEXT, language TEXT, recording_path TEXT,"
              "created_at TEXT, updated_at TEXT, deleted INTEGER DEFAULT 0)");
@@ -693,20 +695,21 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         sqlite3_stmt* st = nullptr;
         prepare("INSERT OR REPLACE INTO voices"
-                "(id,name,description,bundle_path,sample_path,source_audio_seconds,source,created_at,updated_at,deleted)"
-                " VALUES(?,?,?,?,?,?,?,?,?,0)", &st);
+                "(id,name,description,bundle_path,sample_path,source_audio_seconds,source,created_at,updated_at,locked,deleted)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,0)", &st);
         bind(st, 1, v.id); bind(st, 2, v.name); bind(st, 3, v.description);
         bind(st, 4, v.bundle_path); bind(st, 5, v.sample_path);
         sqlite3_bind_double(st, 6, v.source_audio_seconds);
         bind(st, 7, v.source);
         bind(st, 8, v.created_at); bind(st, 9, v.updated_at);
+        sqlite3_bind_int(st, 10, v.locked ? 1 : 0);
         step_done(st);
     }
 
     std::optional<VoiceRecord> get_voice(const std::string& id_or_name) {
         std::lock_guard<std::mutex> lock(mu_);
         sqlite3_stmt* st = nullptr;
-        prepare("SELECT id,name,description,bundle_path,sample_path,source_audio_seconds,source,created_at,updated_at"
+        prepare("SELECT id,name,description,bundle_path,sample_path,source_audio_seconds,source,created_at,updated_at,locked"
                 " FROM voices WHERE deleted=0 AND (id=? OR name=?) LIMIT 1", &st);
         bind(st, 1, id_or_name);
         bind(st, 2, id_or_name);
@@ -721,7 +724,7 @@ public:
     std::vector<VoiceRecord> list_voices() {
         std::lock_guard<std::mutex> lock(mu_);
         sqlite3_stmt* st = nullptr;
-        prepare("SELECT id,name,description,bundle_path,sample_path,source_audio_seconds,source,created_at,updated_at"
+        prepare("SELECT id,name,description,bundle_path,sample_path,source_audio_seconds,source,created_at,updated_at,locked"
                 " FROM voices WHERE deleted=0 ORDER BY created_at DESC", &st);
         std::vector<VoiceRecord> out;
         while (sqlite3_step(st) == SQLITE_ROW) {
@@ -755,6 +758,17 @@ public:
         step_done(st);
         const bool changed = sqlite3_changes(db_) > 0;
         return changed;
+    }
+
+    bool set_voice_locked(const std::string& id, bool locked) {
+        std::lock_guard<std::mutex> lock(mu_);
+        sqlite3_stmt* st = nullptr;
+        prepare("UPDATE voices SET locked=?, updated_at=? WHERE id=? AND deleted=0", &st);
+        sqlite3_bind_int(st, 1, locked ? 1 : 0);
+        bind(st, 2, now_epoch_string());
+        bind(st, 3, id);
+        step_done(st);
+        return sqlite3_changes(db_) > 0;
     }
 
     void insert_consent(const ConsentRecord& c) {
@@ -859,7 +873,8 @@ private:
 
     static VoiceRecord row_voice(sqlite3_stmt* st) {
         return {col(st, 0), col(st, 1), col(st, 2), col(st, 3), col(st, 4),
-                sqlite3_column_double(st, 5), col(st, 6), col(st, 7), col(st, 8)};
+                sqlite3_column_double(st, 5), col(st, 6), col(st, 7), col(st, 8),
+                sqlite3_column_int(st, 9) != 0};
     }
 
     static ConsentRecord row_consent(sqlite3_stmt* st) {
@@ -891,6 +906,7 @@ inline std::string voice_json(const VoiceRecord& v) {
         << "\"sample_path\":\"" << mtts_json_escape(v.sample_path) << "\","
         << "\"source_audio_seconds\":" << v.source_audio_seconds << ","
         << "\"source\":\"" << mtts_json_escape(v.source) << "\","
+        << "\"locked\":" << (v.locked ? "true" : "false") << ","
         << "\"created_at\":\"" << mtts_json_escape(v.created_at) << "\","
         << "\"updated_at\":\"" << mtts_json_escape(v.updated_at) << "\"}";
     return out.str();
@@ -946,7 +962,7 @@ button,input,textarea{font:inherit}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.field{display:grid;gap:6px;margin-bottom:10px}.field label{font-size:12px;color:#5b6472}.field input,.field textarea{border:1px solid #cfd6e1;border-radius:6px;padding:8px;background:white}.field textarea{min-height:64px}
 	.primary{background:#0f766e;color:white;border:0;border-radius:6px;padding:8px 12px;cursor:pointer}.danger{background:#b42318;color:white;border:0;border-radius:6px;padding:7px 10px;cursor:pointer}.secondary{background:#eef2f7;color:#1c2430;border:0;border-radius:6px;padding:7px 10px;cursor:pointer}
 	table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e5e9f0;padding:8px;font-size:13px;vertical-align:top}th{color:#5b6472;font-weight:600}.muted{color:#667085;font-size:13px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all}
-		.icon-cell{width:72px}.select-cell{width:32px}.hover-actions{display:flex;gap:6px;opacity:0;transition:opacity .12s}.voice-row:hover .hover-actions{opacity:1}.icon-btn{width:28px;height:28px;border:1px solid #d6dbe3;background:white;border-radius:6px;cursor:pointer;line-height:1}.icon-btn.active{background:#0f766e;color:white;border-color:#0f766e}.icon-btn.danger-icon{background:#fff5f4;color:#b42318;border-color:#f5b5ae}.icon-btn[disabled]{opacity:.45;cursor:not-allowed}.voice-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.voice-head h2{margin:0}.voice-tools{display:flex;gap:6px;margin-left:auto}.edit-cell{position:relative;min-height:28px}.edit-value{padding-right:32px;white-space:pre-wrap}.edit-btn,.copy-btn{opacity:0;transition:opacity .12s}.voice-row:hover .edit-btn,.path-row:hover .copy-btn{opacity:1}.edit-btn{position:absolute;right:0;top:0}.edit-input{width:100%;box-sizing:border-box;border:1px solid #cfd6e1;border-radius:6px;padding:6px;background:white}.bundle-path{display:flex;align-items:flex-start;gap:6px}.bundle-path .mono{flex:1}.copy-btn{flex:0 0 auto}.add-voice{margin-top:16px;border-top:1px solid #e5e9f0;padding-top:12px}.add-voice summary{cursor:pointer;font-weight:700}.add-voice-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px;align-items:start}.add-voice-grid h3{margin-top:16px}.file-row{display:flex;gap:8px;align-items:center}.file-row input[type=file]{flex:1;min-width:0}.local-preview{width:100%;margin-top:8px}.side-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.side-head h2{margin:0}.duration{white-space:nowrap}.voice-meta{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:6px 12px;margin:12px 0 14px}.voice-meta dt{color:#5b6472;font-size:12px}.voice-meta dd{margin:0;font-size:13px;word-break:break-word}.switch-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:2px 0 12px}.switch-label{font-size:13px;color:#1c2430}.android-switch{position:relative;display:inline-flex;align-items:center;width:46px;height:28px;cursor:pointer;flex:0 0 auto}.android-switch input{position:absolute;opacity:0;width:1px;height:1px}.switch-track{width:46px;height:28px;border-radius:999px;background:#cfd6e1;transition:background .16s,box-shadow .16s}.switch-track:after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:white;box-shadow:0 1px 3px rgba(16,24,40,.28);transition:transform .16s}.android-switch input:checked+.switch-track{background:#0f766e}.android-switch input:checked+.switch-track:after{transform:translateX(18px)}.android-switch input:focus-visible+.switch-track{box-shadow:0 0 0 3px rgba(15,118,110,.22)}.speech-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:12px}.speech-metric{background:#f4f6f8;border:1px solid #e2e6ed;border-radius:6px;padding:8px}.speech-metric span{display:block;color:#667085;font-size:12px}.speech-metric b{font-size:16px}button[disabled]{opacity:.65;cursor:not-allowed}.spinner{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.45);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;margin-right:6px;vertical-align:-1px}@keyframes spin{to{transform:rotate(360deg)}}
+		.icon-cell{width:104px}.select-cell{width:32px}.icon-cell-inner{display:flex;gap:6px;justify-content:flex-end;align-items:center}.hover-actions{display:flex;gap:6px;opacity:0;transition:opacity .12s}.voice-row:hover .hover-actions{opacity:1}.hover-btn{opacity:0;transition:opacity .12s}.voice-row:hover .hover-btn{opacity:1}.icon-btn{width:28px;height:28px;border:1px solid #d6dbe3;background:white;border-radius:6px;cursor:pointer;line-height:1}.icon-btn.active{background:#0f766e;color:white;border-color:#0f766e}.icon-btn.lock-btn.active{background:#b45309;border-color:#b45309;color:white;opacity:1}.icon-btn.danger-icon{background:#fff5f4;color:#b42318;border-color:#f5b5ae}.icon-btn[disabled]{opacity:.45;cursor:not-allowed}.voice-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.voice-head h2{margin:0}.voice-tools{display:flex;gap:6px;margin-left:auto}.edit-cell{position:relative;min-height:28px}.edit-value{padding-right:32px;white-space:pre-wrap}.edit-btn,.copy-btn{opacity:0;transition:opacity .12s}.voice-row:hover .edit-btn,.path-row:hover .copy-btn{opacity:1}.edit-btn{position:absolute;right:0;top:0}.edit-input{width:100%;box-sizing:border-box;border:1px solid #cfd6e1;border-radius:6px;padding:6px;background:white}.bundle-path{display:flex;align-items:flex-start;gap:6px}.bundle-path .mono{flex:1}.copy-btn{flex:0 0 auto}.add-voice{margin-top:16px;border-top:1px solid #e5e9f0;padding-top:12px}.add-voice summary{cursor:pointer;font-weight:700}.add-voice-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px;align-items:start}.add-voice-grid h3{margin-top:16px}.file-row{display:flex;gap:8px;align-items:center}.file-row input[type=file]{flex:1;min-width:0}.local-preview{width:100%;margin-top:8px}.side-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.side-head h2{margin:0}.duration{white-space:nowrap}.voice-meta{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:6px 12px;margin:12px 0 14px}.voice-meta dt{color:#5b6472;font-size:12px}.voice-meta dd{margin:0;font-size:13px;word-break:break-word}.switch-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:2px 0 12px}.switch-label{font-size:13px;color:#1c2430}.android-switch{position:relative;display:inline-flex;align-items:center;width:46px;height:28px;cursor:pointer;flex:0 0 auto}.android-switch input{position:absolute;opacity:0;width:1px;height:1px}.switch-track{width:46px;height:28px;border-radius:999px;background:#cfd6e1;transition:background .16s,box-shadow .16s}.switch-track:after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:white;box-shadow:0 1px 3px rgba(16,24,40,.28);transition:transform .16s}.android-switch input:checked+.switch-track{background:#0f766e}.android-switch input:checked+.switch-track:after{transform:translateX(18px)}.android-switch input:focus-visible+.switch-track{box-shadow:0 0 0 3px rgba(15,118,110,.22)}.speech-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:12px}.speech-metric{background:#f4f6f8;border:1px solid #e2e6ed;border-radius:6px;padding:8px}.speech-metric span{display:block;color:#667085;font-size:12px}.speech-metric b{font-size:16px}button[disabled]{opacity:.65;cursor:not-allowed}.spinner{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.45);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;margin-right:6px;vertical-align:-1px}@keyframes spin{to{transform:rotate(360deg)}}
 .status{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.metric{border:1px solid #e2e6ed;border-radius:6px;padding:10px;background:#f4f6f8}.metric b{display:block;font-size:20px}.metric-waiting{background:#eef4ff;border-color:#b2ccff}.metric-running{background:#ecfdf3;border-color:#75e0a7}.metric-idle{background:#f4f6f8;border-color:#d0d5dd}.metric-submitted{background:#fef7c3;border-color:#fdb022}.metric-failed{background:#fef3f2;border-color:#fda29b}.badge{display:inline-flex;align-items:center;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:700}.badge-tts{background:#e0f2fe;color:#075985}.badge-clone{background:#ecfdf3;color:#067647}.badge-running{background:#dcfce7;color:#166534}.badge-completed{background:#d1fae5;color:#065f46}.badge-failed,.badge-rejected{background:#fee2e2;color:#991b1b}.badge-time{background:#fef3c7;color:#92400e}.job-card{border:1px solid #d6dbe3;border-radius:8px;padding:12px;background:#fff}.job-top{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.job-label{font-size:14px;line-height:1.45;word-break:break-word}.hidden{display:none!important}.login{max-width:380px;margin:80px auto;background:white;border:1px solid #dfe3ea;border-radius:8px;padding:20px}
 .toast{position:fixed;right:16px;bottom:16px;background:#111827;color:white;padding:10px 12px;border-radius:6px;max-width:520px;box-shadow:0 8px 30px rgba(0,0,0,.18)}
 @media(max-width:850px){.grid,.voice-layout.testing,.add-voice-grid{grid-template-columns:1fr}.status{grid-template-columns:1fr 1fr}.top{padding:0 12px}.wrap{padding:12px}.hover-actions,.edit-btn,.copy-btn{opacity:1}}
@@ -1048,8 +1064,8 @@ metricHtml('Waiting',s.queue.waiting,'waiting'),metricHtml('Running',s.queue.run
 function metricHtml(label,value,tone){return `<div class="metric metric-${tone}"><span class="muted">${label}</span><b>${value}</b></div>`}
 function currentJobHtml(j){return `<div class="job-card"><div class="job-top"><span class="badge badge-${escapeAttr(j.kind)}">${escapeHtml(j.kind)}</span><span class="badge badge-running">running</span><span class="badge badge-time">${formatHms(j.elapsed_seconds)}</span><span class="muted">#${j.id}</span></div><div class="job-label">${escapeHtml(truncateText(j.label||'',120))}</div></div>`}
 function recentJobsHtml(jobs){if(!jobs.length)return '<p class="muted">No recent jobs</p>';return '<table><thead><tr><th>ID</th><th>Kind</th><th>Status</th><th>Elapsed</th><th>RTF</th><th>Label</th></tr></thead><tbody>'+jobs.map(j=>`<tr><td>${j.id}</td><td><span class="badge badge-${escapeAttr(j.kind)}">${escapeHtml(j.kind)}</span></td><td><span class="badge badge-${escapeAttr(j.status)}">${escapeHtml(j.status)}</span></td><td>${Number(j.elapsed_seconds).toFixed(2)}s</td><td>${j.rtf?Number(j.rtf).toFixed(2):'-'}</td><td>${escapeHtml(truncateText(j.error||j.label||'',90))}</td></tr>`).join('')+'</tbody></table>'}
-async function loadVoices(){try{const v=await api('/voices');voiceById=Object.fromEntries(v.data.map(x=>[x.id,x]));selectedVoiceIds=new Set([...selectedVoiceIds].filter(id=>voiceById[id]));const selectHead=voiceManageMode?'<th class="select-cell"></th>':'';document.getElementById('voicesTable').innerHTML='<table><thead><tr>'+selectHead+'<th>Name</th><th>Description</th><th>Duration</th><th class="icon-cell"></th></tr></thead><tbody>'+v.data.map(voiceRowHtml).join('')+'</tbody></table>';updateVoiceManageUi()}catch(e){toast(e.message)}}
-function voiceRowHtml(x){const selectCell=voiceManageMode?`<td class="select-cell"><input type="checkbox" aria-label="Select ${escapeAttr(x.name||x.id)}" onchange="toggleVoiceSelected('${escapeJs(x.id)}',this.checked)" ${selectedVoiceIds.has(x.id)?'checked':''}></td>`:'';return `<tr class="voice-row">${selectCell}<td>${editableCell(x,'name')}</td><td>${editableCell(x,'description')}</td><td class="duration">${formatSeconds(x.source_audio_seconds)}</td><td class="icon-cell"><div class="hover-actions"><button class="icon-btn" title="Preview source audio" onclick="previewSourceAudio('${escapeJs(x.id)}')">&#9658;</button><button class="icon-btn" title="Test TTS speech" onclick="openSpeechPanel('${escapeJs(x.id)}')">&#9835;</button></div></td></tr>`}
+async function loadVoices(){try{const v=await api('/voices');voiceById=Object.fromEntries(v.data.map(x=>[x.id,x]));selectedVoiceIds=new Set([...selectedVoiceIds].filter(id=>voiceById[id]&&!voiceById[id].locked));const selectHead=voiceManageMode?'<th class="select-cell"><input type="checkbox" id="voiceSelectAll" aria-label="Select all unlocked voices" title="Select all unlocked voices" onchange="toggleSelectAllVoices(this.checked)"></th>':'';document.getElementById('voicesTable').innerHTML='<table><thead><tr>'+selectHead+'<th>Name</th><th>Description</th><th>Duration</th><th class="icon-cell"></th></tr></thead><tbody>'+v.data.map(voiceRowHtml).join('')+'</tbody></table>';updateVoiceManageUi()}catch(e){toast(e.message)}}
+function voiceRowHtml(x){const selectCell=voiceManageMode?`<td class="select-cell"><input type="checkbox" aria-label="Select ${escapeAttr(x.name||x.id)}" onchange="toggleVoiceSelected('${escapeJs(x.id)}',this.checked)" ${x.locked?'disabled title="Locked voice"':''} ${selectedVoiceIds.has(x.id)?'checked':''}></td>`:'';const lockBtn=x.locked?`<button class="icon-btn lock-btn active" title="Locked — click to unlock" onclick="toggleVoiceLock('${escapeJs(x.id)}',false)">&#128274;</button>`:`<button class="icon-btn lock-btn hover-btn" title="Lock voice" onclick="toggleVoiceLock('${escapeJs(x.id)}',true)">&#128275;</button>`;return `<tr class="voice-row">${selectCell}<td>${editableCell(x,'name')}</td><td>${editableCell(x,'description')}</td><td class="duration">${formatSeconds(x.source_audio_seconds)}</td><td class="icon-cell"><div class="icon-cell-inner"><div class="hover-actions"><button class="icon-btn" title="Preview source audio" onclick="previewSourceAudio('${escapeJs(x.id)}')">&#9658;</button><button class="icon-btn" title="Test TTS speech" onclick="openSpeechPanel('${escapeJs(x.id)}')">&#9835;</button></div>${lockBtn}</div></td></tr>`}
 function editableCell(x,field){const id=escapeJs(x.id);const value=escapeHtml(x[field]||'');const label=field==='name'?'name':'description';return `<div id="cell-${label}-${escapeAttr(x.id)}" class="edit-cell"><div class="edit-value">${value||'-'}</div><button class="icon-btn edit-btn" title="Edit ${label}" onclick="beginEdit('${id}','${label}')">&#9998;</button></div>`}
 	async function importVoice(){const btn=document.getElementById('importSubmit');try{setButtonBusy(btn,true,'Importing');await api('/voices',{method:'POST',json:{name:val('importName'),description:val('importDescription'),bundle_path:val('importBundle')}});toast('Voice imported');loadVoices()}catch(e){toast(e.message)}finally{setButtonBusy(btn,false)}}
 	async function cloneVoice(){const btn=document.getElementById('cloneSubmit');try{const f=document.getElementById('cloneFile').files[0];if(!f){toast('Choose an audio file');return}setButtonBusy(btn,true,'Creating');const fd=new FormData();fd.append('name',val('cloneName'));fd.append('description',val('cloneDescription'));fd.append('audio_sample',f);await api('/voices',{method:'POST',body:fd});toast('Clone queued/completed');loadVoices();loadStatus()}catch(e){toast(e.message)}finally{setButtonBusy(btn,false)}}
@@ -1062,8 +1078,10 @@ function beginEdit(id,field){const voice=voiceById[id];if(!voice)return;const ce
 function editKey(event,id,field){if(event.key==='Enter'){event.preventDefault();saveVoiceField(id,field,event.target.value)}else if(event.key==='Escape'){event.preventDefault();loadVoices()}}
 async function deleteVoice(id){if(!confirm('Delete '+id+'?'))return;try{await api('/voices/'+id,{method:'DELETE'});toast('Deleted');loadVoices()}catch(e){toast(e.message)}}
 function toggleVoiceManage(){voiceManageMode=!voiceManageMode;if(!voiceManageMode)selectedVoiceIds.clear();loadVoices()}
-function toggleVoiceSelected(id,checked){if(checked)selectedVoiceIds.add(id);else selectedVoiceIds.delete(id);updateVoiceManageUi()}
-function updateVoiceManageUi(){const manage=document.getElementById('voiceManageToggle');const del=document.getElementById('voiceBatchDelete');if(manage)manage.classList.toggle('active',voiceManageMode);if(del){del.classList.toggle('hidden',!voiceManageMode);del.disabled=selectedVoiceIds.size===0;del.title=selectedVoiceIds.size?`Delete ${selectedVoiceIds.size} selected voice${selectedVoiceIds.size>1?'s':''}`:'Delete selected voices'}}
+function toggleVoiceSelected(id,checked){const voice=voiceById[id];if(voice&&voice.locked)return;if(checked)selectedVoiceIds.add(id);else selectedVoiceIds.delete(id);updateVoiceManageUi()}
+function toggleSelectAllVoices(checked){const unlocked=Object.values(voiceById).filter(x=>!x.locked).map(x=>x.id);if(checked)unlocked.forEach(id=>selectedVoiceIds.add(id));else unlocked.forEach(id=>selectedVoiceIds.delete(id));loadVoices()}
+async function toggleVoiceLock(id,locked){try{await api('/voices/'+id+'/lock',{method:'POST',json:{locked:!!locked}});toast(locked?'Locked':'Unlocked');loadVoices()}catch(e){toast(e.message)}}
+function updateVoiceManageUi(){const manage=document.getElementById('voiceManageToggle');const del=document.getElementById('voiceBatchDelete');if(manage)manage.classList.toggle('active',voiceManageMode);const all=document.getElementById('voiceSelectAll');if(all){const unlocked=Object.values(voiceById).filter(x=>!x.locked);const sel=unlocked.filter(x=>selectedVoiceIds.has(x.id)).length;all.checked=unlocked.length>0&&sel===unlocked.length;all.indeterminate=sel>0&&sel<unlocked.length}if(del){del.classList.toggle('hidden',!voiceManageMode);del.disabled=selectedVoiceIds.size===0;del.title=selectedVoiceIds.size?`Delete ${selectedVoiceIds.size} selected voice${selectedVoiceIds.size>1?'s':''}`:'Delete selected voices'}}
 async function deleteSelectedVoices(){const ids=[...selectedVoiceIds];if(!ids.length)return;if(!confirm('Delete '+ids.length+' selected voice'+(ids.length>1?'s':'')+'?'))return;const btn=document.getElementById('voiceBatchDelete');try{btn.disabled=true;for(const id of ids){await api('/voices/'+id,{method:'DELETE'})}selectedVoiceIds.clear();toast('Deleted '+ids.length+' voice'+(ids.length>1?'s':''));loadVoices()}catch(e){toast(e.message);updateVoiceManageUi()}}
 async function previewSourceAudio(id){try{const blob=await api('/voices/'+id+'/source-audio');if(previewAudioUrl){URL.revokeObjectURL(previewAudioUrl);previewAudioUrl=''}previewAudioUrl=URL.createObjectURL(blob);const a=document.getElementById('previewAudio');a.src=previewAudioUrl;a.classList.remove('hidden');await a.play().catch(()=>{})}catch(e){toast(e.message)}}
 function openSpeechPanel(id){const voice=voiceById[id]||{id,name:'-',description:'-',bundle_path:'-'};selectedSpeechVoice=id;document.getElementById('speechVoiceId').textContent=id;document.getElementById('speechVoiceName').textContent=voice.name||'-';document.getElementById('speechVoiceDescription').textContent=voice.description||'-';document.getElementById('speechBundlePath').textContent=voice.bundle_path||'-';document.getElementById('voiceLayout').classList.add('testing');document.getElementById('speechPanel').classList.remove('hidden');document.getElementById('speechResult').textContent='';document.getElementById('speechMetrics').classList.add('hidden')}
@@ -1620,6 +1638,25 @@ inline void handle_connection(int fd,
             std::string id = effective_path.substr(prefix.size());
             id.resize(id.size() - std::string("/source-audio").size());
             send_voice_source_audio(fd, store, id);
+        } else if (method == "POST" &&
+                   (effective_path.rfind("/api/voices/", 0) == 0 ||
+                    effective_path.rfind("/v1/audio/voices/", 0) == 0 ||
+                    effective_path.rfind("/voices/", 0) == 0) &&
+                   effective_path.size() >= std::string("/lock").size() &&
+                   effective_path.compare(effective_path.size() - std::string("/lock").size(),
+                                          std::string("/lock").size(),
+                                          "/lock") == 0) {
+            const std::string prefix = effective_path.rfind("/api/voices/", 0) == 0
+                ? "/api/voices/"
+                : (effective_path.rfind("/v1/audio/voices/", 0) == 0 ? "/v1/audio/voices/" : "/voices/");
+            std::string id = effective_path.substr(prefix.size());
+            id.resize(id.size() - std::string("/lock").size());
+            const bool locked = json_bool_field(body, "locked", true);
+            if (!store.set_voice_locked(id, locked)) {
+                send_json_error(fd, 404, "Not Found", "voice not found");
+            } else {
+                send_response(fd, 200, "OK", "application/json", voice_json(*store.get_voice(id)));
+            }
         } else if (effective_path.rfind("/api/voices/", 0) == 0 ||
                    effective_path.rfind("/v1/audio/voices/", 0) == 0 ||
                    effective_path.rfind("/voices/", 0) == 0) {
@@ -1656,7 +1693,11 @@ inline void handle_connection(int fd,
                 }
 	            } else if (method == "DELETE") {
 	                auto v = store.get_voice(id);
-	                if (!v || !store.delete_voice(id)) {
+	                if (!v) {
+	                    send_json_error(fd, 404, "Not Found", "voice not found");
+	                } else if (v->locked) {
+	                    send_json_error(fd, 409, "Conflict", "voice is locked");
+	                } else if (!store.delete_voice(id)) {
 	                    send_json_error(fd, 404, "Not Found", "voice not found");
 	                } else {
 	                    remove_voice_files(store, *v);

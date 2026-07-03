@@ -260,6 +260,51 @@ Response:
 {"deleted":true}
 ```
 
+## Client / Cached Voices
+
+### `POST /v1/audio/client_voices`
+
+Alias: `POST /v1/audio/remote_voices`.
+
+Clone a voice (or accept an already-cloned bundle) and either persist it to the
+voice store or keep it only in an in-memory LRU cache (capacity 20, override with
+`MIT2_VOICE_CACHE_SIZE`). Cached voices can be used by `/v1/audio/speech` via
+their `voice_id` without ever being written to disk or sqlite.
+
+`multipart/form-data` fields:
+
+- `audio_sample` / `pt`: one-of. `audio_sample` is cloned into a bundle; `pt` is
+  an existing valid `MIT2` bundle used verbatim (no cloning).
+- `persist`: optional boolean, default `false`. When `true`, the voice is stored
+  as a `.pt` bundle plus a sqlite record; otherwise it goes to the in-memory cache.
+- `consent`: voice name.
+- `description`: free text.
+- `voice_id`: unique id (generated if omitted).
+
+Responses:
+
+- Cloned from `audio_sample`: on success returns the generated `.pt` bundle as an
+  `application/octet-stream` body.
+- Supplied `pt`: returns a JSON acknowledgement (no bundle stream needed).
+- Failure: JSON error.
+- If `persist=true` and `voice_id` already exists locally and is **locked**, no
+  cloning happens and the existing local `.pt` bytes are returned unchanged.
+
+```bash
+# Clone into the in-memory cache (not persisted), get the .pt back:
+curl -X POST http://127.0.0.1:3456/v1/audio/client_voices \
+  -F "audio_sample=@$HOME/tmp/voice_consent/audio_sample_recording.wav;type=audio/x-wav" \
+  -F "persist=false" \
+  -F "voice_id=voice_demo" \
+  -F "consent=Demo Voice" \
+  -o voice_demo.pt
+
+# Cache an existing bundle by id (JSON ack, no stream):
+curl -X POST http://127.0.0.1:3456/v1/audio/client_voices \
+  -F "pt=@voice_demo.pt" \
+  -F "voice_id=voice_demo"
+```
+
 ## OpenAI-Compatible Speech
 
 ### `POST /v1/audio/speech`
@@ -270,7 +315,9 @@ Request fields:
 
 - `model`: accepted for OpenAI compatibility. The server uses `--model_bundle`.
 - `input`: required text.
-- `voice`: optional. May be a string voice ID/path or an object with `id`.
+- `voice`: optional. May be a string voice ID/path or an object with `id`. The id
+  is resolved first against the sqlite/disk voice store, then against the
+  in-memory client-voice cache populated by `/v1/audio/client_voices`.
 - `response_format`: optional. Only `wav` is supported.
 - `output`: optional server-side output WAV path. If omitted, the response body is `audio/wav`.
 - `stream`: optional boolean. If `output` is set, default response is JSON ack. Set `stream: true` to also return WAV bytes.

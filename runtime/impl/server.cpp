@@ -3,6 +3,7 @@
 //
 // Supported OpenAI-style endpoints:
 //   POST /v1/audio/speech
+//   POST /v1/audio/client_voices  (alias: /v1/audio/remote_voices)
 //   POST /v1/audio/voice_consents
 //   GET/PATCH/DELETE /v1/audio/voice_consents/{id}
 //   POST /v1/audio/voices
@@ -36,6 +37,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -896,6 +898,58 @@ private:
     std::mutex mu_;
 };
 
+// In-memory LRU cache of voice bundles (".pt" file bytes) that are NOT persisted
+// to sqlite/disk. Keyed by client-supplied voice_id. Used by
+// POST /v1/audio/client_voices when persist=false so that a cloned/imported
+// voice can be referenced by /v1/audio/speech without being written to the
+// voice store. Capacity defaults to 20; the least-recently-used entry is
+// evicted once the cap is exceeded.
+class VoiceCache {
+public:
+    explicit VoiceCache(size_t capacity = 20) : capacity_(std::max<size_t>(1, capacity)) {}
+
+    void put(const std::string& voice_id, std::string pt_bytes) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = map_.find(voice_id);
+        if (it != map_.end()) {
+            order_.erase(it->second.order_it);
+        }
+        order_.push_front(voice_id);
+        map_[voice_id] = Entry{std::move(pt_bytes), order_.begin()};
+        while (order_.size() > capacity_) {
+            map_.erase(order_.back());
+            order_.pop_back();
+        }
+    }
+
+    std::optional<std::string> get(const std::string& voice_id) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = map_.find(voice_id);
+        if (it == map_.end()) {
+            return std::nullopt;
+        }
+        order_.erase(it->second.order_it);
+        order_.push_front(voice_id);
+        it->second.order_it = order_.begin();
+        return it->second.bytes;
+    }
+
+    bool contains(const std::string& voice_id) {
+        std::lock_guard<std::mutex> lock(mu_);
+        return map_.find(voice_id) != map_.end();
+    }
+
+private:
+    struct Entry {
+        std::string bytes;
+        std::list<std::string>::iterator order_it;
+    };
+    std::mutex mu_;
+    size_t capacity_;
+    std::list<std::string> order_;  // front = most-recently-used
+    std::unordered_map<std::string, Entry> map_;
+};
+
 inline std::string voice_json(const VoiceRecord& v) {
     std::ostringstream out;
     out << "{\"id\":\"" << mtts_json_escape(v.id) << "\","
@@ -1481,6 +1535,7 @@ inline bool create_voice_from_request(int fd,
 inline void handle_speech(int fd,
                           const std::string& body,
                           VoiceStore& store,
+                          VoiceCache& cache,
                           const ServerConfig& cfg,
                           WorkDispatcher& dispatcher,
                           uint64_t request_id) {
@@ -1498,12 +1553,23 @@ inline void handle_speech(int fd,
         send_json_error(fd, 400, "Bad Request", "only response_format=wav is supported");
         return;
     }
-    const std::string voice_bundle = store.resolve_voice_bundle(voice.empty() ? "sample/qin.pt" : voice);
+    std::filesystem::create_directories("outputs");
+    // Resolve the requested voice. Persisted voices (sqlite/disk) win; if not
+    // found there, fall back to the in-memory client-voice LRU cache and
+    // materialize its ".pt" bytes to a per-request temp bundle for synthesis.
+    std::string voice_bundle = store.resolve_voice_bundle(voice.empty() ? "sample/qin.pt" : voice);
+    std::string temp_voice_bundle;
+    if (voice_bundle.empty() && !voice.empty()) {
+        if (auto cached = cache.get(voice)) {
+            temp_voice_bundle = "outputs/.tmp_voice_" + std::to_string(request_id) + ".pt";
+            save_file_bytes(temp_voice_bundle, *cached);
+            voice_bundle = temp_voice_bundle;
+        }
+    }
     if (voice_bundle.empty()) {
         send_json_error(fd, 400, "Bad Request", "voice not found or not a usable voice bundle");
         return;
     }
-    std::filesystem::create_directories("outputs");
     const bool keep_output = !output_param.empty();
     const std::string out_wav = keep_output
         ? output_param
@@ -1514,10 +1580,18 @@ inline void handle_speech(int fd,
 
     std::string error;
     if (!run_tts_capture(cfg, dispatcher, voice_bundle, input, out_wav, error)) {
+        if (!temp_voice_bundle.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(temp_voice_bundle, ec);
+        }
         send_json_error(fd, error == "tts queue is full" ? 429 : 500,
                         error == "tts queue is full" ? "Too Many Requests" : "Internal Server Error",
                         error);
         return;
+    }
+    if (!temp_voice_bundle.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(temp_voice_bundle, ec);
     }
 
     std::string wav_bytes;
@@ -1557,8 +1631,184 @@ inline void handle_speech(int fd,
     }
 }
 
+inline bool parse_form_bool(const std::string& s, bool fallback) {
+    if (s == "true" || s == "1" || s == "yes" || s == "on") return true;
+    if (s == "false" || s == "0" || s == "no" || s == "off" || s.empty()) return fallback;
+    return fallback;
+}
+
+// Read the single-file ".pt" bytes backing a voice record, if any. Directory
+// bundles have no single stream to return, so this yields an empty string.
+inline std::string local_bundle_pt_bytes(const VoiceRecord& v) {
+    if (mit2::bundle_path_is_single_file(v.bundle_path)) {
+        return read_file_bytes(v.bundle_path);
+    }
+    return {};
+}
+
+// POST /v1/audio/client_voices (also /v1/audio/remote_voices)
+//
+// Clone a voice from `audio_sample`, or accept an already-cloned `pt` bundle,
+// and either persist it to the sqlite/disk voice store (persist=true) or keep
+// it only in the in-memory LRU cache (persist=false, default) so it can be used
+// by /v1/audio/speech without touching disk.
+//
+//   audio_sample / pt : one-of. audio_sample is cloned; pt is used verbatim.
+//   persist           : bool, default false.
+//   consent           : voice name.
+//   description       : free text.
+//   voice_id          : unique id (generated if omitted).
+//
+// On success: for audio_sample, returns the generated ".pt" bundle as a binary
+// stream; for pt (no output needed), returns a JSON acknowledgement. On failure
+// returns a JSON error. If persist=true and voice_id already exists locally and
+// is locked, no cloning happens and the existing local ".pt" bytes are returned.
+inline void handle_client_voices(int fd,
+                                 const std::string& head,
+                                 const std::string& body,
+                                 VoiceStore& store,
+                                 VoiceCache& cache,
+                                 const ServerConfig& cfg,
+                                 WorkDispatcher& dispatcher,
+                                 uint64_t request_id) {
+    namespace fs = std::filesystem;
+    const std::string ct = content_type_from_head(head);
+    if (ct.find("multipart/form-data") == std::string::npos) {
+        send_json_error(fd, 400, "Bad Request", "expected multipart/form-data request");
+        return;
+    }
+    const auto parts = parse_multipart(ct, body);
+    const bool persist = parse_form_bool(multipart_value(parts, "persist"), false);
+    const std::string name = multipart_value(parts, "consent");
+    const std::string description = multipart_value(parts, "description");
+    std::string voice_id = multipart_value(parts, "voice_id");
+    if (voice_id.empty()) {
+        voice_id = make_id("voice");
+    }
+    const auto pt_file = multipart_file(parts, {"pt"});
+    const auto audio_file = multipart_file(parts, {"audio_sample", "recording", "audio", "file"});
+    if (!pt_file && !audio_file) {
+        send_json_error(fd, 400, "Bad Request", "missing audio_sample or pt");
+        return;
+    }
+
+    // Helper: respond with the existing local ".pt" bytes for a locked voice,
+    // or a JSON note if the bundle is not a single-file ".pt".
+    auto respond_locked_local = [&](const VoiceRecord& existing) {
+        const std::string bytes = local_bundle_pt_bytes(existing);
+        if (!bytes.empty()) {
+            send_response(fd, 200, "OK", "application/octet-stream", bytes);
+        } else {
+            std::ostringstream out;
+            out << "{\"status\":\"locked\",\"voice_id\":\"" << mtts_json_escape(existing.id)
+                << "\",\"persisted\":true,\"cached\":false,"
+                << "\"message\":\"voice is locked; no clone performed\"}";
+            send_response(fd, 200, "OK", "application/json", out.str());
+        }
+    };
+
+    // ---- Case 1: caller supplied a ready-made pt bundle (no cloning). --------
+    if (pt_file) {
+        const std::string& pt_bytes = pt_file->data;
+        if (pt_bytes.size() < 4 || pt_bytes.compare(0, 4, "MIT2") != 0) {
+            send_json_error(fd, 400, "Bad Request", "pt is not a valid MIT2 voice bundle");
+            return;
+        }
+        bool cached = false;
+        bool persisted = false;
+        if (persist) {
+            const auto existing = store.get_voice(voice_id);
+            if (existing && existing->locked) {
+                respond_locked_local(*existing);
+                return;
+            }
+            const std::string out_bundle = (fs::path(store.bundles_dir()) / (voice_id + ".pt")).string();
+            save_file_bytes(out_bundle, pt_bytes);
+            const std::string now = now_epoch_string();
+            VoiceRecord v{voice_id,
+                          name.empty() ? (existing ? existing->name : voice_id) : name,
+                          description,
+                          out_bundle,
+                          std::string{},
+                          source_audio_seconds_for_voice(out_bundle, ""),
+                          "import",
+                          existing ? existing->created_at : now,
+                          now};
+            store.insert_voice(v);
+            persisted = true;
+        } else {
+            cache.put(voice_id, pt_bytes);
+            cached = true;
+        }
+        std::ostringstream out;
+        out << "{\"status\":\"ok\",\"voice_id\":\"" << mtts_json_escape(voice_id)
+            << "\",\"persisted\":" << (persisted ? "true" : "false")
+            << ",\"cached\":" << (cached ? "true" : "false")
+            << ",\"source\":\"pt\"}";
+        send_response(fd, 200, "OK", "application/json", out.str());
+        return;
+    }
+
+    // ---- Case 2: clone the voice from an uploaded audio sample. --------------
+    if (persist) {
+        const auto existing = store.get_voice(voice_id);
+        if (existing && existing->locked) {
+            respond_locked_local(*existing);
+            return;
+        }
+    }
+    const std::string sample_tmp =
+        (fs::path(store.samples_dir()) / (make_id("sample") + safe_ext(audio_file->filename, ".wav"))).string();
+    save_file_bytes(sample_tmp, audio_file->data);
+
+    const std::string out_bundle = persist
+        ? (fs::path(store.bundles_dir()) / (voice_id + ".pt")).string()
+        : (fs::path(store.bundles_dir()) / (voice_id + "." + std::to_string(request_id) + ".tmp.pt")).string();
+
+    std::string error;
+    const bool ok = run_clone_capture(cfg, dispatcher, sample_tmp, out_bundle, error);
+    std::error_code ec;
+    if (!ok) {
+        fs::remove(sample_tmp, ec);
+        if (!persist) fs::remove(out_bundle, ec);
+        send_json_error(fd, error == "clone queue is full" ? 429 : 500,
+                        error == "clone queue is full" ? "Too Many Requests" : "Internal Server Error",
+                        error.empty() ? "clone failed" : error);
+        return;
+    }
+
+    const std::string pt_bytes = read_file_bytes(out_bundle);
+    if (persist) {
+        const auto existing = store.get_voice(voice_id);
+        const std::string now = now_epoch_string();
+        const double source_seconds = source_audio_seconds_for_voice(out_bundle, sample_tmp);
+        VoiceRecord v{voice_id,
+                      name.empty() ? (existing ? existing->name : voice_id) : name,
+                      description,
+                      out_bundle,
+                      std::string{},
+                      source_seconds,
+                      "clone",
+                      existing ? existing->created_at : now,
+                      now};
+        store.insert_voice(v);
+        fs::remove(sample_tmp, ec);
+    } else {
+        cache.put(voice_id, pt_bytes);
+        fs::remove(out_bundle, ec);
+        fs::remove(sample_tmp, ec);
+    }
+
+    if (pt_bytes.empty()) {
+        send_json_error(fd, 500, "Internal Server Error", "clone produced an empty bundle");
+        return;
+    }
+    send_response(fd, 200, "OK", "application/octet-stream", pt_bytes);
+}
+
 inline void handle_connection(int fd,
                               VoiceStore& store,
+                              VoiceCache& cache,
                               const ServerConfig& cfg,
                               WorkDispatcher& dispatcher,
                               uint64_t request_id) {
@@ -1619,7 +1869,11 @@ inline void handle_connection(int fd,
         } else if (method == "GET" && (effective_path == "/api/status" || effective_path == "/status")) {
             send_response(fd, 200, "OK", "application/json", dispatcher.status_json(cfg));
         } else if (method == "POST" && (effective_path == "/v1/audio/speech" || effective_path == "/speech")) {
-            handle_speech(fd, body, store, cfg, dispatcher, request_id);
+            handle_speech(fd, body, store, cache, cfg, dispatcher, request_id);
+        } else if (method == "POST" && (effective_path == "/v1/audio/client_voices" ||
+                                        effective_path == "/v1/audio/remote_voices" ||
+                                        effective_path == "/client_voices")) {
+            handle_client_voices(fd, head, body, store, cache, cfg, dispatcher, request_id);
         } else if (method == "GET" && (effective_path == "/api/voices" || effective_path == "/v1/audio/voices" || effective_path == "/voices")) {
             send_voice_list(fd, store);
         } else if (method == "POST" && (effective_path == "/api/voices" || effective_path == "/v1/audio/voices" || effective_path == "/voices")) {
@@ -1807,6 +2061,7 @@ int run_server(const std::string& host,
     cfg.verbose = verbose;
 
     VoiceStore store(cfg.voice_store_dir);
+    VoiceCache voice_cache(env_u32("MIT2_VOICE_CACHE_SIZE", 20, 1, 1000));
     WorkDispatcher dispatcher(cfg.queue_size);
 
     const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -1833,7 +2088,7 @@ int run_server(const std::string& host,
     }
     std::filesystem::create_directories("outputs");
     std::cerr << ">> mit2_tts server listening on http://" << host << ":" << port << std::endl;
-    std::cerr << ">> endpoints: POST /v1/audio/speech, POST /v1/audio/voice_consents, /api/voices" << std::endl;
+    std::cerr << ">> endpoints: POST /v1/audio/speech, POST /v1/audio/client_voices, POST /v1/audio/voice_consents, /api/voices" << std::endl;
     if (cfg.web_enabled) {
         std::cerr << ">> web admin: http://" << host << ":" << port << "/web"
                   << (cfg.web_key.empty() ? "  (no web key configured)" : "") << std::endl;
@@ -1852,8 +2107,8 @@ int run_server(const std::string& host,
                 continue;
             }
             const uint64_t request_id = request_counter.fetch_add(1) + 1;
-            std::thread([fd, &store, &cfg, &dispatcher, request_id] {
-                handle_connection(fd, store, cfg, dispatcher, request_id);
+            std::thread([fd, &store, &voice_cache, &cfg, &dispatcher, request_id] {
+                handle_connection(fd, store, voice_cache, cfg, dispatcher, request_id);
             }).detach();
         }
     });

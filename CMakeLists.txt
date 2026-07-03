@@ -8,6 +8,20 @@ set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 
 find_package(CURL REQUIRED)
 
+# Some macOS SDK layouts resolve CURL's include dir to the SDK's own
+# usr/include. Propagating that through the imported target as an -isystem path
+# reorders the header search so libc++'s <cstdlib>/<cstdio> can no longer find
+# their backing C headers, which breaks compilation. That SDK usr/include is
+# already a default search path, so strip it from the imported target's
+# interface includes when it is what CURL resolved to.
+if(TARGET CURL::libcurl)
+  get_target_property(_mit2_curl_inc CURL::libcurl INTERFACE_INCLUDE_DIRECTORIES)
+  if(_mit2_curl_inc)
+    list(FILTER _mit2_curl_inc EXCLUDE REGEX "SDKs/MacOSX[^/]*\\.sdk/usr/include$")
+    set_target_properties(CURL::libcurl PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${_mit2_curl_inc}")
+  endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Text-frontend dependencies: SentencePiece (BPE) + kaldifst (OpenFST engine
 # for the wetext text-normalization grammars). These give the native runtime a

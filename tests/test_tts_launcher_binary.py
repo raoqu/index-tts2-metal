@@ -18667,6 +18667,26 @@ def test_mit2_tts_text_readiness_reports_supported_native_surface():
     ]
 
 
+def test_mit2_tts_standard_segmentation_keeps_short_reading_tail_together():
+    text = (
+        "但从那时起，中国做得非常好，拥抱开源开放权zhong4生态系统，"
+        "中国的团队会在互联网上免费进行研究并发表他们的研究论文供任何人阅读。"
+    )
+    report = _run_json("--text-readiness", str(MODEL_BUNDLE), text)
+
+    standard = next(preset for preset in report["presets"] if preset["name"] == "standard")
+    assert standard["segment_count"] == 2
+    assert [len(segment["ids"]) for segment in standard["segments"]] == [51, 67]
+    assert standard["segments"][-1]["pieces"][-5:] == ["▁", "阅", "▁", "读", "▁."]
+    assert all(
+        not (
+            left["pieces"][-1:] == ["阅"]
+            and right["pieces"][:2] == ["▁", "读"]
+        )
+        for left, right in zip(standard["segments"], standard["segments"][1:])
+    )
+
+
 def test_mit2_tts_text_readiness_reports_leading_zero_currency_surface():
     report = _run_json("--text-readiness", str(MODEL_BUNDLE), "￥01000")
 

@@ -1993,6 +1993,56 @@ static std::vector<CjkSegmentRange> split_cjk_ranges_by_token(
     return merged;
 }
 
+static bool cjk_piece_ends_sentence(const std::string& piece) {
+    static const std::vector<std::string> sentence_end_tokens{
+        ".",
+        "!",
+        "?",
+        "\xe2\x96\x81.",
+        "\xe2\x96\x81!",
+        "\xe2\x96\x81?",
+        "\xe2\x96\x81...",
+    };
+    return cjk_split_tokens_contain(sentence_end_tokens, piece);
+}
+
+// A strict max-token chunk can leave only one or two Hanzi in the final
+// segment. Synthesizing that fragment independently gives the preceding Hanzi
+// end-of-utterance prosody, then concat adds interval silence before the last
+// Hanzi (for example, "阅" | "读。"). Allow a small bounded overflow instead:
+// keeping the short tail with its unpunctuated predecessor is both cheaper than
+// another acoustic pass and preserves word-level prosody.
+static std::vector<CjkSegmentRange> coalesce_cjk_short_tail_ranges(
+    const std::vector<std::string>& pieces,
+    const std::vector<CjkSegmentRange>& ranges,
+    size_t max_tokens) {
+    // Tiny smoke-test chunks deliberately exercise the strict limit.
+    if (max_tokens < 32 || ranges.size() < 2) {
+        return ranges;
+    }
+    const size_t overflow_slack = std::max<size_t>(4, max_tokens / 8);
+    std::vector<CjkSegmentRange> coalesced;
+    coalesced.reserve(ranges.size());
+    for (const auto& range : ranges) {
+        if (!coalesced.empty()) {
+            auto& previous = coalesced.back();
+            const size_t combined = previous.size() + range.size();
+            const bool previous_ends_sentence =
+                previous.end > previous.start &&
+                cjk_piece_ends_sentence(pieces[previous.end - 1]);
+            if (previous.end == range.start &&
+                range.size() <= overflow_slack &&
+                combined <= max_tokens + overflow_slack &&
+                !previous_ends_sentence) {
+                previous.end = range.end;
+                continue;
+            }
+        }
+        coalesced.push_back(range);
+    }
+    return coalesced;
+}
+
 std::vector<CjkTokenizedSegment> split_cjk_tokenized_text(const CjkTokenizedText& tokenized, uint32_t max_tokens) {
     if (max_tokens == 0) {
         throw std::runtime_error("native CJK segment split max_tokens must be positive");
@@ -2005,11 +2055,15 @@ std::vector<CjkTokenizedSegment> split_cjk_tokenized_text(const CjkTokenizedText
         "\xe2\x96\x81?",
         "\xe2\x96\x81...",
     };
-    const auto ranges = split_cjk_ranges_by_token(
+    const auto strict_ranges = split_cjk_ranges_by_token(
         tokenized.pieces,
         0,
         tokenized.ids.size(),
         punctuation_marks_tokens,
+        static_cast<size_t>(max_tokens));
+    const auto ranges = coalesce_cjk_short_tail_ranges(
+        tokenized.pieces,
+        strict_ranges,
         static_cast<size_t>(max_tokens));
 
     std::vector<CjkTokenizedSegment> segments;

@@ -1915,7 +1915,10 @@ GptGreedyOutputs run_gpt_kv_greedy_metal(mit2::MetalContext& metal,
                                          uint32_t steps,
                                          bool hf_generate_positions = false,
                                          const GptSamplingConfig* sampling = nullptr,
-                                         const std::vector<uint32_t>* repetition_history_prefix = nullptr) {
+                                         const std::vector<uint32_t>* repetition_history_prefix = nullptr,
+                                         bool allow_icb = true,
+                                         std::vector<float>* logits_trace = nullptr,
+                                         std::vector<float>* processed_trace = nullptr) {
     constexpr uint32_t vocab = 8194;
     constexpr uint32_t width = 1280;
     constexpr uint32_t qkv_width = 3840;
@@ -1961,15 +1964,22 @@ GptGreedyOutputs run_gpt_kv_greedy_metal(mit2::MetalContext& metal,
         const char* v = std::getenv("MIT2_GPT_ICB");
         return !(v && v[0] == '0');
     }();
-    if (!(sampling && sampling->do_sample) && gpt_icb_enabled) {
+    const bool cpu_sampling = sampling && sampling->do_sample;
+    static const bool sampled_icb_enabled = []() {
+        const char* v = std::getenv("MIT2_GPT_SAMPLED_ICB");
+        // CPU sampling still synchronizes once per token. M3 Ultra A/B runs
+        // showed no stable latency gain, so retain this as an opt-in experiment.
+        return v && v[0] == '1';
+    }();
+    const bool use_icb = allow_icb && gpt_icb_enabled && (!cpu_sampling || sampled_icb_enabled);
+    if (use_icb) {
         // ---------------------------------------------------------------
-        // ICB greedy decode: the 127-dispatch per-token graph is recorded
-        // ONCE into an indirect command buffer over a dedicated workspace;
-        // each chunk just executes it K times (near-zero CPU encode).
-        // kv_tokens/position/step live in a GPU state buffer advanced by a
-        // recorded kernel; token ids land in a GPU history array.
+        // Record a reusable per-token graph over a dedicated workspace.
+        // Greedy advances token/state on GPU in chunks; sampling replays one
+        // token and leaves probability processing and RNG on the CPU.
+        // The graph key includes mode because their heads and tails differ.
         // ---------------------------------------------------------------
-        if (!metal.gptIcbAvailable()) {
+        if (!metal.gptIcbAvailable(cpu_sampling)) {
             const size_t icb_ws_bytes =
                 (static_cast<size_t>(1 + width) +
                  static_cast<size_t>(n_layers) * (qkv_width + width + width + mlp_width + width) +
@@ -2020,41 +2030,48 @@ GptGreedyOutputs run_gpt_kv_greedy_metal(mit2::MetalContext& metal,
                 "gpt.final_norm.weight.resident", weights.final_norm_weight,
                 "gpt.final_norm.bias.resident", weights.final_norm_bias,
                 ln_f_out, width, 1e-5f);
-            auto logits_slot = metal.gptIcb_fused_gemv_f16w(
+            auto logits_slot = cpu_sampling ? metal.gptIcb_linear(
+                "gpt.mel_head.weight.resident", weights.head_weight,
+                "gpt.mel_head.bias.resident", weights.head_bias,
+                final_norm_out, vocab, width) : metal.gptIcb_fused_gemv_f16w(
                 "gpt.mel_head.weight.resident", weights.head_weight,
                 "gpt.mel_head.bias.resident", weights.head_bias,
                 final_norm_out, vocab, width,
                 false, "", {}, "", {},
                 false, false, no_res, 1e-5f);
-            metal.gptIcb_argmax_into(logits_slot, vocab, token_slot);
-            metal.gptIcb_record_token(token_slot);
-            metal.gptIcb_advance_state();
-            metal.gptIcbEndRecord(token_slot, logits_slot);
+            if (!cpu_sampling) {
+                metal.gptIcb_argmax_into(logits_slot, vocab, token_slot);
+                metal.gptIcb_record_token(token_slot);
+                metal.gptIcb_advance_state();
+            }
+            metal.gptIcbEndRecord(token_slot, logits_slot, cpu_sampling);
         }
 
-        constexpr uint32_t kIcbChunk = 8;
-        uint32_t step = 0;
-        bool stopped = false;
-        while (step < steps && !stopped) {
-            const uint32_t chunk = std::min(kIcbChunk, steps - step);
-            auto res = metal.gptIcbExecute(chunk, out.input_tokens.back(), kv_tokens_counter, step, vocab);
-            out.last_logits = res.last_logits;
-            out.last_processed_logits = out.last_logits;
-            for (uint32_t j = 0; j < chunk; ++j) {
-                const uint32_t next = res.tokens[j];
-                ++kv_tokens_counter;
-                out.predicted_tokens.push_back(next);
-                if (next == stop_mel_token && out.first_stop_step < 0) {
-                    out.first_stop_step = static_cast<int32_t>(step + j);
-                    stopped = true;
-                    kv_tokens_counter -= 1;
-                    break;
+        if (!cpu_sampling) {
+            constexpr uint32_t kIcbChunk = 8;
+            uint32_t step = 0;
+            bool stopped = false;
+            while (step < steps && !stopped) {
+                const uint32_t chunk = std::min(kIcbChunk, steps - step);
+                auto res = metal.gptIcbExecute(chunk, out.input_tokens.back(), kv_tokens_counter, step, vocab);
+                out.last_logits = res.last_logits;
+                out.last_processed_logits = out.last_logits;
+                for (uint32_t j = 0; j < chunk; ++j) {
+                    const uint32_t next = res.tokens[j];
+                    ++kv_tokens_counter;
+                    out.predicted_tokens.push_back(next);
+                    if (next == stop_mel_token && out.first_stop_step < 0) {
+                        out.first_stop_step = static_cast<int32_t>(step + j);
+                        stopped = true;
+                        kv_tokens_counter -= 1;
+                        break;
+                    }
+                    out.input_tokens.push_back(next);
                 }
-                out.input_tokens.push_back(next);
+                step += chunk;
             }
-            step += chunk;
+            return out;
         }
-        return out;
     }
 
     if (!(sampling && sampling->do_sample)) {
@@ -2158,64 +2175,70 @@ GptGreedyOutputs run_gpt_kv_greedy_metal(mit2::MetalContext& metal,
     for (uint32_t step = 0; step < steps; ++step) {
         const uint32_t kv_tokens = kv_tokens_counter;
 
-        const std::vector<float> current_in = build_gpt_greedy_current_cached(
-            weights, out.input_tokens.back(), gpt_cached_generate_position(step, hf_generate_positions));
+        if (use_icb) {
+            auto result = metal.gptIcbExecute(1, out.input_tokens.back(), kv_tokens,
+                                               step, vocab, hf_generate_positions);
+            out.last_logits = std::move(result.last_logits);
+        } else {
+            const std::vector<float> current_in = build_gpt_greedy_current_cached(
+                weights, out.input_tokens.back(), gpt_cached_generate_position(step, hf_generate_positions));
 
-        metal.beginPass(workspace_bytes);
-        auto current_slot = metal.passUploadAlloc(current_in);
+            metal.beginPass(workspace_bytes);
+            auto current_slot = metal.passUploadAlloc(current_in);
 
-        const mit2::PassSlot no_residual{};
-        for (uint32_t l = 0; l < n_layers; ++l) {
-            const auto& lw = weights.layers[l];
+            const mit2::PassSlot no_residual{};
+            for (uint32_t l = 0; l < n_layers; ++l) {
+                const auto& lw = weights.layers[l];
 
-            // 5 fused dispatches per layer (was 10): ln1+qkv, attention,
-            // proj+residual, ln2+fc+gelu, mlp_proj+residual.
-            auto qkv_slot = metal.gpt_fused_gemv_f16w_pass(
-                resident_weight_key(lw, "attn.c_attn"), lw.c_attn_weight,
-                resident_bias_key(lw, "attn.c_attn"), lw.c_attn_bias,
-                current_slot, qkv_width, width,
-                /*has_ln=*/true, resident_weight_key(lw, "ln_1"), lw.ln1_weight,
-                resident_bias_key(lw, "ln_1"), lw.ln1_bias,
-                /*gelu=*/false, /*residual=*/false, no_residual, 1e-5f);
-            auto attn_out = metal.gpt_cached_attention_resident_pass(
-                l, qkv_slot, kv_tokens, heads, head_dim);
-            auto attn_residual = metal.gpt_fused_gemv_f16w_pass(
-                resident_weight_key(lw, "attn.c_proj"), lw.attn_proj_weight,
-                resident_bias_key(lw, "attn.c_proj"), lw.attn_proj_bias,
-                attn_out, width, width,
-                /*has_ln=*/false, "", {}, "", {},
-                /*gelu=*/false, /*residual=*/true, current_slot, 1e-5f);
-            auto gelu_out = metal.gpt_fused_gemv_f16w_pass(
-                resident_weight_key(lw, "mlp.c_fc"), lw.c_fc_weight,
-                resident_bias_key(lw, "mlp.c_fc"), lw.c_fc_bias,
-                attn_residual, mlp_width, width,
-                /*has_ln=*/true, resident_weight_key(lw, "ln_2"), lw.ln2_weight,
-                resident_bias_key(lw, "ln_2"), lw.ln2_bias,
-                /*gelu=*/true, /*residual=*/false, no_residual, 1e-5f);
-            current_slot = metal.gpt_fused_gemv_f16w_pass(
-                resident_weight_key(lw, "mlp.c_proj"), lw.mlp_proj_weight,
-                resident_bias_key(lw, "mlp.c_proj"), lw.mlp_proj_bias,
-                gelu_out, width, mlp_width,
-                /*has_ln=*/false, "", {}, "", {},
-                /*gelu=*/false, /*residual=*/true, attn_residual, 1e-5f);
+                // 5 fused dispatches per layer (was 10): ln1+qkv, attention,
+                // proj+residual, ln2+fc+gelu, mlp_proj+residual.
+                auto qkv_slot = metal.gpt_fused_gemv_f16w_pass(
+                    resident_weight_key(lw, "attn.c_attn"), lw.c_attn_weight,
+                    resident_bias_key(lw, "attn.c_attn"), lw.c_attn_bias,
+                    current_slot, qkv_width, width,
+                    /*has_ln=*/true, resident_weight_key(lw, "ln_1"), lw.ln1_weight,
+                    resident_bias_key(lw, "ln_1"), lw.ln1_bias,
+                    /*gelu=*/false, /*residual=*/false, no_residual, 1e-5f);
+                auto attn_out = metal.gpt_cached_attention_resident_pass(
+                    l, qkv_slot, kv_tokens, heads, head_dim);
+                auto attn_residual = metal.gpt_fused_gemv_f16w_pass(
+                    resident_weight_key(lw, "attn.c_proj"), lw.attn_proj_weight,
+                    resident_bias_key(lw, "attn.c_proj"), lw.attn_proj_bias,
+                    attn_out, width, width,
+                    /*has_ln=*/false, "", {}, "", {},
+                    /*gelu=*/false, /*residual=*/true, current_slot, 1e-5f);
+                auto gelu_out = metal.gpt_fused_gemv_f16w_pass(
+                    resident_weight_key(lw, "mlp.c_fc"), lw.c_fc_weight,
+                    resident_bias_key(lw, "mlp.c_fc"), lw.c_fc_bias,
+                    attn_residual, mlp_width, width,
+                    /*has_ln=*/true, resident_weight_key(lw, "ln_2"), lw.ln2_weight,
+                    resident_bias_key(lw, "ln_2"), lw.ln2_bias,
+                    /*gelu=*/true, /*residual=*/false, no_residual, 1e-5f);
+                current_slot = metal.gpt_fused_gemv_f16w_pass(
+                    resident_weight_key(lw, "mlp.c_proj"), lw.mlp_proj_weight,
+                    resident_bias_key(lw, "mlp.c_proj"), lw.mlp_proj_bias,
+                    gelu_out, width, mlp_width,
+                    /*has_ln=*/false, "", {}, "", {},
+                    /*gelu=*/false, /*residual=*/true, attn_residual, 1e-5f);
+            }
+
+            auto ln_f_out = metal.layernorm_f32_pass(
+                "gpt.gpt.ln_f.weight.resident", weights.ln_f_weight,
+                "gpt.gpt.ln_f.bias.resident", weights.ln_f_bias,
+                current_slot, width, 1e-5f);
+            auto final_norm_out = metal.layernorm_f32_pass(
+                "gpt.final_norm.weight.resident", weights.final_norm_weight,
+                "gpt.final_norm.bias.resident", weights.final_norm_bias,
+                ln_f_out, width, 1e-5f);
+            auto logits_slot = metal.linear_f32_pass(
+                "gpt.mel_head.weight.resident", weights.head_weight,
+                "gpt.mel_head.bias.resident", weights.head_bias,
+                final_norm_out, vocab, width);
+
+            metal.endPass();
+
+            out.last_logits = metal.passRead(logits_slot);
         }
-
-        auto ln_f_out = metal.layernorm_f32_pass(
-            "gpt.gpt.ln_f.weight.resident", weights.ln_f_weight,
-            "gpt.gpt.ln_f.bias.resident", weights.ln_f_bias,
-            current_slot, width, 1e-5f);
-        auto final_norm_out = metal.layernorm_f32_pass(
-            "gpt.final_norm.weight.resident", weights.final_norm_weight,
-            "gpt.final_norm.bias.resident", weights.final_norm_bias,
-            ln_f_out, width, 1e-5f);
-        auto logits_slot = metal.linear_f32_pass(
-            "gpt.mel_head.weight.resident", weights.head_weight,
-            "gpt.mel_head.bias.resident", weights.head_bias,
-            final_norm_out, vocab, width);
-
-        metal.endPass();
-
-        out.last_logits = metal.passRead(logits_slot);
         ++kv_tokens_counter;  // K/V appended on-GPU by the resident attention op
 
         uint32_t next = 0;
@@ -2233,6 +2256,12 @@ GptGreedyOutputs run_gpt_kv_greedy_metal(mit2::MetalContext& metal,
             out.last_processed_logits = out.last_logits;
             next = argmax_row(out.last_logits, 0, vocab);
         }
+        if (logits_trace) {
+            logits_trace->insert(logits_trace->end(), out.last_logits.begin(), out.last_logits.end());
+        }
+        if (processed_trace) {
+            processed_trace->insert(processed_trace->end(), out.last_processed_logits.begin(), out.last_processed_logits.end());
+        }
         out.predicted_tokens.push_back(next);
         if (next == stop_mel_token && out.first_stop_step < 0) {
             out.first_stop_step = static_cast<int32_t>(step);
@@ -2241,6 +2270,77 @@ GptGreedyOutputs run_gpt_kv_greedy_metal(mit2::MetalContext& metal,
         out.input_tokens.push_back(next);
     }
     return out;
+}
+
+// Compare the complete per-step sampling boundary, not only final token IDs.
+// Reuse one context across mode changes and KV growth to catch stale ICB bindings.
+bool run_gpt_sampled_icb_parity_test(const std::string& bundle_dir,
+                                     const std::string& conds_path,
+                                     const std::string& text_ids_path) {
+    mit2::Bundle bundle(bundle_dir);
+    mit2::MetalContext metal;
+    const auto conds = read_raw_f32(conds_path);
+    const auto text_ids = read_raw_u32(text_ids_path);
+    if (conds.empty() || conds.size() % 1280 != 0) {
+        throw std::invalid_argument("sampled ICB parity: invalid conditioning");
+    }
+    const auto exact = [](const std::vector<float>& a, const std::vector<float>& b) {
+        return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+    };
+    bool all_ok = true;
+    std::cout << "{\n  \"stage\": \"gpt_sampled_icb_parity\",\n  \"cases\": [\n";
+    for (uint32_t i = 0; i < 4; ++i) {
+        const uint32_t steps = 16 + i * 16;
+        const std::vector<uint32_t> case_ids(text_ids.begin(),
+            text_ids.begin() + (i % 2 ? text_ids.size() / 2 : text_ids.size()));
+        auto prefix = run_gpt_prepare_inputs_metal(metal, bundle, conds, case_ids,
+            static_cast<uint32_t>(conds.size() / 1280), static_cast<uint32_t>(case_ids.size()));
+        const uint32_t prefix_tokens = static_cast<uint32_t>(prefix.inputs_embeds.size() / 1280);
+        const bool hf_positions = i != 2;
+        GptSamplingConfig sampling;
+        sampling.do_sample = true;
+        sampling.seed = 20240605 + (i % 3);
+        sampling.temperature = i == 3 ? 0.8f : 1.0f;
+        sampling.top_k = i == 2 ? 0 : 30;
+        sampling.top_p = i == 2 ? 1.0f : 0.8f;
+        sampling.repetition_penalty = i == 2 ? 1.0f : 10.0f;
+        const std::vector<uint32_t> history{8192, 17, 17, 42};
+        if (i == 2) metal.gptKvCacheCreate(24, 3072, 1280);
+        // A greedy graph before each sampled graph exercises graph-mode keys.
+        auto greedy_before = run_gpt_kv_greedy_metal(metal, bundle, prefix.inputs_embeds,
+                                                     prefix_tokens, 4, true);
+        std::vector<float> ref_logits, got_logits, ref_processed, got_processed;
+        auto ref = run_gpt_kv_greedy_metal(metal, bundle, prefix.inputs_embeds,
+                                           prefix_tokens, steps, hf_positions, &sampling, &history,
+                                           false, &ref_logits, &ref_processed);
+        auto got = run_gpt_kv_greedy_metal(metal, bundle, prefix.inputs_embeds,
+                                           prefix_tokens, steps, hf_positions, &sampling, &history,
+                                           true, &got_logits, &got_processed);
+        const bool sampled_graph = metal.gptIcbAvailable(true);
+        // The next sampling request reuses the already-recorded graph.
+        auto repeat = run_gpt_kv_greedy_metal(metal, bundle, prefix.inputs_embeds,
+                                              prefix_tokens, steps, hf_positions, &sampling, &history);
+        auto greedy_after = run_gpt_kv_greedy_metal(metal, bundle, prefix.inputs_embeds,
+                                                    prefix_tokens, 4, true);
+        const bool logits_ok = exact(ref_logits, got_logits) &&
+            std::all_of(got_logits.begin(), got_logits.end(), [](float v) { return std::isfinite(v); });
+        const bool processed_ok = exact(ref_processed, got_processed);
+        const bool codes_ok = ref.predicted_tokens == got.predicted_tokens &&
+            got.predicted_tokens == repeat.predicted_tokens && ref.first_stop_step == got.first_stop_step;
+        const bool greedy_ok = greedy_before.predicted_tokens == greedy_after.predicted_tokens &&
+            exact(greedy_before.last_logits, greedy_after.last_logits) && metal.gptIcbAvailable(false);
+        const bool ok = sampled_graph && logits_ok && processed_ok && codes_ok && greedy_ok;
+        all_ok = all_ok && ok;
+        std::cout << "    {\"seed\":" << sampling.seed << ",\"steps\":" << steps
+                  << ",\"hf_positions\":" << (hf_positions ? "true" : "false")
+                  << ",\"logits_exact\":" << (logits_ok ? "true" : "false")
+                  << ",\"processed_exact\":" << (processed_ok ? "true" : "false")
+                  << ",\"codes_exact\":" << (codes_ok ? "true" : "false")
+                  << ",\"mode_switch_ok\":" << (greedy_ok && sampled_graph ? "true" : "false")
+                  << "}" << (i < 3 ? ",\n" : "\n");
+    }
+    std::cout << "  ],\n  \"passed\": " << (all_ok ? "true" : "false") << "\n}\n";
+    return all_ok;
 }
 
 bool run_gpt_greedy_test(const std::string& bundle_dir) {
@@ -5472,4 +5572,3 @@ bool run_timestep_embedder_test(const std::string& bundle_dir) {
     std::cout << "}\n";
     return err <= 1e-4f;
 }
-

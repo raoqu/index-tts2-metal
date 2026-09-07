@@ -168,6 +168,7 @@ struct MetalContext::Impl {
     uint32_t gpt_icb_max_commands = 0;
     bool gpt_icb_recording = false;
     bool gpt_icb_ready = false;
+    bool gpt_icb_cpu_sampling = false;
     NSUInteger gpt_icb_token_off = 0;
     NSUInteger gpt_icb_logits_off = 0;
     std::vector<id<MTLResource>> gpt_icb_read_resources;
@@ -5340,8 +5341,8 @@ std::vector<float> MetalContext::gpt_causal_attention_f32(const std::vector<floa
     }
 }
 
-bool MetalContext::gptIcbAvailable() const {
-    return impl_->gpt_icb_ready;
+bool MetalContext::gptIcbAvailable(bool cpu_sampling) const {
+    return impl_->gpt_icb_ready && impl_->gpt_icb_cpu_sampling == cpu_sampling;
 }
 
 void MetalContext::gptIcbInvalidate() {
@@ -5454,6 +5455,35 @@ PassSlot MetalContext::gptIcb_fused_gemv_f16w(const std::string& wk, const std::
     return out;
 }
 
+PassSlot MetalContext::gptIcb_linear(const std::string& wk, const std::vector<float>& w,
+                                   const std::string& bk, const std::vector<float>& b,
+                                   PassSlot x, uint32_t rows, uint32_t cols) {
+    Impl* im = impl_;
+    // This entry is for the large single-row mel head. Match linear_f32_pass
+    // exactly rather than substituting the greedy path's fused GEMV kernel.
+    if (rows < 256 || cols < 64) {
+        throw std::invalid_argument("gptIcb_linear requires GEMV dimensions");
+    }
+    id<MTLBuffer> bbuf = im->resident_buffer_with_bytes(bk, b.data(), b.size() * sizeof(float));
+    bool f16 = false;
+    id<MTLBuffer> wbuf = im->weight_buffer_pref_f16(wk, w, fp16_weights_enabled(), f16);
+    im->icb_track_read(wbuf);
+    im->icb_track_read(bbuf);
+    auto out = im->icb_alloc_raw(rows);
+    auto cmd = im->icb_next_command();
+    [cmd setComputePipelineState:(f16 ? im->linear_gemv_f16w_pipeline : im->linear_gemv_pipeline)];
+    [cmd setKernelBuffer:wbuf offset:0 atIndex:0];
+    [cmd setKernelBuffer:bbuf offset:0 atIndex:1];
+    [cmd setKernelBuffer:im->gpt_icb_ws offset:x.byte_offset atIndex:2];
+    [cmd setKernelBuffer:im->gpt_icb_ws offset:out.byte_offset atIndex:3];
+    [cmd setKernelBuffer:im->icb_const_u32(rows) offset:0 atIndex:4];
+    [cmd setKernelBuffer:im->icb_const_u32(cols) offset:0 atIndex:5];
+    [cmd setBarrier];
+    [cmd concurrentDispatchThreadgroups:MTLSizeMake((rows + 7) / 8, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return out;
+}
+
 PassSlot MetalContext::gptIcb_attention_resident(uint32_t layer, PassSlot qkv, uint32_t heads, uint32_t head_dim) {
     Impl* im = impl_;
     if (!im->gpt_kv_buffer || layer >= im->gpt_kv_layers) {
@@ -5533,20 +5563,34 @@ void MetalContext::gptIcb_advance_state() {
                   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
-void MetalContext::gptIcbEndRecord(PassSlot token_slot, PassSlot logits_slot) {
+void MetalContext::gptIcbEndRecord(PassSlot token_slot, PassSlot logits_slot, bool cpu_sampling) {
     Impl* im = impl_;
+    // Constants and tied parameters are referenced by many commands. Declare
+    // each resource once at replay time; all indirect reads remain covered.
+    std::vector<id<MTLResource>> unique_resources;
+    unique_resources.reserve(im->gpt_icb_read_resources.size());
+    for (id<MTLResource> resource : im->gpt_icb_read_resources) {
+        if (std::find(unique_resources.begin(), unique_resources.end(), resource) == unique_resources.end()) {
+            unique_resources.push_back(resource);
+        }
+    }
+    im->gpt_icb_read_resources.swap(unique_resources);
     im->gpt_icb_token_off = token_slot.byte_offset;
     im->gpt_icb_logits_off = logits_slot.byte_offset;
     im->gpt_icb_recording = false;
+    im->gpt_icb_cpu_sampling = cpu_sampling;
     im->gpt_icb_ready = true;
 }
 
 MetalContext::GptIcbResult MetalContext::gptIcbExecute(uint32_t n_tokens, uint32_t seed_token,
                                                        uint32_t kv_tokens_start, uint32_t step_start,
-                                                       uint32_t vocab) {
+                                                       uint32_t vocab, bool hf_generate_positions) {
     Impl* im = impl_;
     if (!im->gpt_icb_ready) {
         throw std::logic_error("gptIcbExecute: ICB not recorded");
+    }
+    if (im->gpt_icb_cpu_sampling && n_tokens != 1) {
+        throw std::invalid_argument("gptIcbExecute: CPU sampling requires one token");
     }
     if (step_start + n_tokens > im->gpt_icb_history_capacity) {
         throw std::invalid_argument("gptIcbExecute: history capacity exceeded");
@@ -5555,7 +5599,7 @@ MetalContext::GptIcbResult MetalContext::gptIcbExecute(uint32_t n_tokens, uint32
         uint32_t* st = static_cast<uint32_t*>([im->gpt_icb_state contents]);
         st[0] = kv_tokens_start;
         st[2] = step_start;
-        st[1] = (step_start == 0) ? 0 : step_start + 1;
+        st[1] = (hf_generate_positions && step_start > 0) ? step_start + 1 : step_start;
         uint32_t* tok = reinterpret_cast<uint32_t*>(
             static_cast<uint8_t*>([im->gpt_icb_ws contents]) + im->gpt_icb_token_off);
         tok[0] = seed_token;
@@ -5582,7 +5626,9 @@ MetalContext::GptIcbResult MetalContext::gptIcbExecute(uint32_t n_tokens, uint32
 
         GptIcbResult result;
         const uint32_t* hist = static_cast<const uint32_t*>([im->gpt_icb_history contents]);
-        result.tokens.assign(hist + step_start, hist + step_start + n_tokens);
+        if (!im->gpt_icb_cpu_sampling) {
+            result.tokens.assign(hist + step_start, hist + step_start + n_tokens);
+        }
         const float* logits = reinterpret_cast<const float*>(
             static_cast<const uint8_t*>([im->gpt_icb_ws contents]) + im->gpt_icb_logits_off);
         result.last_logits.assign(logits, logits + vocab);

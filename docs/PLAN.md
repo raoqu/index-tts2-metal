@@ -2,7 +2,7 @@
 
 日期：2026-09-07
 
-状态：P0 用户听感验证通过，但其跨后端数值门槛未通过的记录保留。P1 已实现并完成本句逐位一致验证，等待用户试听；P2/P3 尚未开始。
+状态：P0、P1 用户听感验证通过，P0 的跨后端数值门槛未通过记录保留。P2 已实现，采样与音频一致性通过，但未证明提速，作为默认关闭的实验路径等待用户试听；P3 尚未开始。
 
 执行规则（用户要求）：分步执行，每一步用同一句话、同一音色、相同参数生成优化前后两段音频；必须等用户听感判定后再进入下一步。听感结论与数值精度结论分别记录。
 
@@ -184,8 +184,8 @@ GPU 基准顺序运行，避免多个实验竞争 GPU。
 - [x] 使用现有二进制复测 BigVGAN 两种后端的阶段速度。
 - [x] 从当前源码构建 Release 并建立可追溯基线。
 - [ ] P0：完成 BigVGAN 真实输入精度验证和后端选择评估。
-- [x] P1：实现 CFM 条件投影外提并验证本句逐位一致；等待用户听感判定。
-- [ ] P2：实现保留 CPU 采样的 ICB 路径并验证确定性。
+- [x] P1：实现 CFM 条件投影外提并验证本句逐位一致；用户听感验证通过。
+- [x] P2：实现保留 CPU 采样的 ICB 路径并验证确定性；未通过性能验收，默认关闭，等待用户试听。
 - [ ] P3：完成 LayerNorm/GEMV 微基准，决定是否实施。
 - [ ] 完成组合优化的端到端精度、性能与内存回归。
 
@@ -233,7 +233,7 @@ GPU 基准顺序运行，避免多个实验竞争 GPU。
 
 同目录保存测试二进制 `mtts`、诊断改动 `source.patch`、各阶段日志和 float32 张量。复现命令：`python3 artifacts/tts-optimization/p0/run_comparison.py`，会覆盖本轮同名产物。
 
-## 12. P1 执行记录：本句逐位一致，等待试听
+## 12. P1 执行记录：本句逐位一致，用户听感通过
 
 改动：`run_cfm_euler_metal_single_pass()` 在 Euler 循环前计算一次条件投影，输出保存在原有 `cond_proj_slot` 中。循环内继续使用相同的输入合并、Transformer、Wavenet 和 Euler 更新。未更改算子、形状、dtype、步数或 scratch 分配布局，保留 Metal helper 自带的依赖屏障。
 
@@ -262,7 +262,7 @@ text IDs、GPT codes、condition、noise、生成 mel 和 float32 waveform 均�
 
 **结论：本句 16 步的输出逐位一致；阶段基准仅显示小幅收益。850 帧、16 步两轮约节省 1.7–1.8 毫秒，约 0.27%–0.28%。本句端到端差约 7.8 毫秒，接近测量波动范围，不能宣称显著提速。** 12/25 步表格是性能结果，不代表这些配置已完成逐位一致验证。
 
-Release 构建和 `git diff --check` 通过。P1 暂停等待用户试听，不进入 P2。
+Release 构建和 `git diff --check` 通过。用户随后反馈 **“通过，继续”**，据此进入 P2。
 
 本轮产物：
 
@@ -275,3 +275,75 @@ Release 构建和 `git diff --check` 通过。P1 暂停等待用户试听，不�
 - [CFM 基准复现脚本](../artifacts/tts-optimization/p1/bench_cfm.py)
 
 同目录保留 `mtts_after` 和源码差异 `source.patch`；前置基线二进制位于 P0 产物目录。复现脚本会覆盖同名产物。
+
+## 13. P2 执行记录：输出一致，但未证明提速，默认关闭
+
+基线 revision：`9ff210f`（包含 P1 和诊断张量导出）。本轮只实现采样模式的 ICB，不执行 P3。
+
+### 实现
+
+- greedy 和 sampling 共用 Transformer 图录制流程，以解码模式区分图缓存。
+- sampling 每次执行一个 token，不录制 greedy 的 argmax、token 记录或状态推进操作。
+- sampling 的 mel head 继续使用原 `linear_f32_pass` 对应的 GEMV kernel、数据类型和线程配置，避免直接替换成 greedy 的融合 GEMV。
+- CPU 继续负责原有 top-k/top-p、temperature、repetition penalty、double 概率累计及 SplitMix64 随机数。
+- 保留原位置编码规则，每次重放更新 token、KV token 数和位置。
+- KV 分配布局变化时继续使录制图失效；切换 greedy/sampling 时重录。
+- 录制结束时去除重复的只读资源声明，避免每个 token 反复声明相同资源。
+- 由于性能没有稳定改善，**最终源码默认关闭 sampling ICB**；`MIT2_GPT_SAMPLED_ICB=1` 显式启用，`MIT2_GPT_ICB=0` 仍可关闭 ICB 总路径。
+
+### 精度验证
+
+新增 `--test-gpt-sampled-icb-parity BUNDLE CONDS TEXT_IDS`，在同一进程内比较旧 pass 与 sampling ICB：
+
+- 3 个 seed，4 组配置，分别生成最多 16/32/48/64 个 token。
+- 检查每步原始 logits 和采样处理后的 logits 逐位一致，原始 logits 全部有限。
+- 检查 codes、停止位置和重复生成结果。
+- 覆盖完整/较短文本前缀、两种位置编码模式、top-k/top-p/repetition penalty 的启用与禁用。
+- 覆盖 greedy → sampling → greedy 切换及 KV 容量从 2048 增长到 3072。
+
+4 组测试全部通过。最终默认关闭版本使用以下命令显式测试候选路径：
+
+```bash
+MIT2_GPT_SAMPLED_ICB=1 ./build/mtts --test-gpt-sampled-icb-parity \
+  bin \
+  artifacts/tts-optimization/p1/after.wav.conds.f32 \
+  artifacts/tts-optimization/p1/after.wav.text_ids.u32
+```
+
+整句音频沿用 P0/P1 的文本、“琴”音色、16 步 CFM 和全部采样参数。A 使用 P1 二进制，B 使用 P2 候选；两者均启用已试听认可的 BigVGAN 备用后端。
+
+text IDs、GPT codes、condition、noise、mel、float32 waveform 及 WAV 文件全部逐位一致。输出 325 个有效 codes、559 帧 mel、143104 个采样点（6.48998 秒）。WAV SHA-256 仍为 `2bab7ba8353eb2ec2b6549e714d17899b4072ab072dc79b3f840c6b1a0dbd7eb`，与已接受的 P1 相同。
+
+### 性能验证
+
+第一次单次对比显示小幅改善，但复测结果接近波动范围，因此另行关闭诊断导出，在每个独立常驻进程内先预热一次，再连续测量 4 次；本轮顺序为 B→A。
+
+| 项目 | A：原采样 pass | B：sampling ICB |
+| --- | ---: | ---: |
+| 热请求 1 | 3.75782 秒 | 3.83898 秒 |
+| 热请求 2 | 3.75166 秒 | 3.80402 秒 |
+| 热请求 3 | 3.75423 秒 | 3.80553 秒 |
+| 热请求 4 | 3.77416 秒 | 3.81187 秒 |
+| 请求墙钟中位数 | 3.756025 秒 | 3.808700 秒 |
+| GPT 阶段中位数 | 1.948955 秒 | 1.984220 秒 |
+| 每请求 GPT command buffers | 329 | 329 |
+
+B 的请求墙钟中位数约慢 1.40%，GPT 阶段约慢 1.81%。上述多次请求的 WAV 均与基线逐位一致。
+
+**判定：P2 精度通过，但当前 M3 Ultra 上未证明稳定提速，不能作为有效加速默认启用。CPU 采样仍要求逐 token 同步，提交数没有减少。保留可选实验实现，默认走原采样 pass；不放宽精度、不改变采样方法来追求速度。** 尚未独立拆出 CPU 编码/采样耗时，因此不把上述总耗时差异全部归因于某个 CPU 环节。
+
+P2 停在用户试听环节；确认后再执行 P3。
+
+### 产物
+
+- [A：P2 优化前音频](../artifacts/tts-optimization/p2/before.wav)
+- [B：P2 候选音频](../artifacts/tts-optimization/p2/after.wav)
+- [逐步采样一致性测试](../artifacts/tts-optimization/p2/final_icb_parity.json)
+- [整句精度与单次耗时](../artifacts/tts-optimization/p2/metrics.json)
+- [4 次热请求性能结果](../artifacts/tts-optimization/p2/warm_benchmark.json)
+- [配置与二进制标识](../artifacts/tts-optimization/p2/metadata.json)
+- [最终构建的显式启用和默认回退检查](../artifacts/tts-optimization/p2/final_build_checks.json)
+- [A/B 复现脚本](../artifacts/tts-optimization/p2/run_comparison.py)
+- [热请求基准脚本](../artifacts/tts-optimization/p2/bench_warm.py)
+
+目录保留性能测试时的候选二进制 `mtts_after`，以及最终默认关闭版本 `mtts_final`；源码差异保存为 `source.patch`。复现脚本会覆盖同名产物。

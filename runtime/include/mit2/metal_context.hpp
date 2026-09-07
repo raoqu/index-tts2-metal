@@ -244,9 +244,10 @@ public:
     // GPT decode ICB: record the per-token dispatch graph ONCE into an
     // MTLIndirectCommandBuffer over a dedicated stable workspace, then execute
     // it N times per command buffer. Varying scalars (kv_tokens / position /
-    // step) live in a GPU state buffer advanced by a recorded kernel.
+    // step) live in a GPU state buffer. Greedy advances it on GPU; CPU sampling
+    // updates it before each single-token replay and reads back only logits.
     // ------------------------------------------------------------------
-    bool gptIcbAvailable() const;
+    bool gptIcbAvailable(bool cpu_sampling = false) const;
     void gptIcbInvalidate();
     void gptIcbBeginRecord(uint32_t max_commands, size_t ws_bytes, uint32_t max_history);
     PassSlot gptIcbAlloc(uint32_t element_count);
@@ -261,19 +262,24 @@ public:
                                     const std::string& bek, const std::vector<float>& be,
                                     bool fuse_gelu, bool has_residual, PassSlot residual, float eps);
     PassSlot gptIcb_attention_resident(uint32_t layer, PassSlot qkv, uint32_t heads, uint32_t head_dim);
+    // Same GEMV kernel and precision policy as linear_f32_pass (sampling head).
+    PassSlot gptIcb_linear(const std::string& wk, const std::vector<float>& w,
+                          const std::string& bk, const std::vector<float>& b,
+                          PassSlot x, uint32_t rows, uint32_t cols);
     PassSlot gptIcb_layernorm(const std::string& gamma_key, const std::vector<float>& gamma,
                               const std::string& beta_key, const std::vector<float>& beta,
                               PassSlot x, uint32_t count, float eps);
     void gptIcb_argmax_into(PassSlot logits, uint32_t vocab, PassSlot token_slot);
     void gptIcb_record_token(PassSlot token_slot);
     void gptIcb_advance_state();
-    void gptIcbEndRecord(PassSlot token_slot, PassSlot logits_slot);
+    void gptIcbEndRecord(PassSlot token_slot, PassSlot logits_slot, bool cpu_sampling = false);
     struct GptIcbResult {
         std::vector<uint32_t> tokens;
         std::vector<float> last_logits;
     };
     GptIcbResult gptIcbExecute(uint32_t n_tokens, uint32_t seed_token,
-                               uint32_t kv_tokens_start, uint32_t step_start, uint32_t vocab);
+                               uint32_t kv_tokens_start, uint32_t step_start, uint32_t vocab,
+                               bool hf_generate_positions = true);
 
     // GPT decode pass ops (single-row layernorm, GELU, KV-cache attention).
     PassSlot layernorm_f32_pass(const std::string& gamma_key, const std::vector<float>& gamma,

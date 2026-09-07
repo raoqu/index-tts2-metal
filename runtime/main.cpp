@@ -508,6 +508,7 @@ void usage(const char* argv0) {
               << " [--test-gpt-kv-codes-inputs BUNDLE_DIR CONDS_F32 TEXT_IDS_U32 MAX_CODES EXPECTED_CODES_U32]"
               << " [--export-gpt-kv-codes-inputs-sampled BUNDLE_DIR CONDS_F32 TEXT_IDS_U32 MAX_CODES SEED TEMPERATURE TOP_K TOP_P REPETITION_PENALTY OUTPUT_CODES_U32]"
               << " [--test-gpt-sampled-inputs-determinism BUNDLE_DIR CONDS_F32 TEXT_IDS_U32 MAX_CODES]"
+              << " [--test-gpt-sampled-icb-parity BUNDLE_DIR CONDS_F32 TEXT_IDS_U32]"
               << " [--test-gpt-latent-golden BUNDLE_DIR GOLDEN_DIR]"
               << " [--trace-gpt-latent-golden BUNDLE_DIR GOLDEN_DIR]"
               << " [--test-length-regulator-golden BUNDLE_DIR GOLDEN_DIR]"
@@ -2878,6 +2879,11 @@ static int run_cli(int argc, char** argv) {
                 export_gpt_kv_codes_inputs_sampled_config.top_p = std::stof(argv[++i]);
                 export_gpt_kv_codes_inputs_sampled_config.repetition_penalty = std::stof(argv[++i]);
                 export_gpt_kv_codes_inputs_sampled_output_path = argv[++i];
+            } else if (arg == "--test-gpt-sampled-icb-parity" && i + 3 < argc) {
+                const std::string bdir = argv[++i];
+                const std::string conds = argv[++i];
+                const std::string ids = argv[++i];
+                return run_gpt_sampled_icb_parity_test(bdir, conds, ids) ? 0 : 1;
             } else if (arg == "--test-gpt-sampled-inputs-determinism" && i + 4 < argc) {
                 test_gpt_sampled_inputs_determinism_bundle_dir = argv[++i];
                 test_gpt_sampled_inputs_determinism_conds_path = argv[++i];

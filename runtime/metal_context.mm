@@ -585,9 +585,9 @@ static bool bigvgan_im2col_enabled_for_device() {
         if (parse_env_bool_override("MIT2_BIGVGAN_IM2COL", forced)) {
             return forced;
         }
-        // M3 Ultra keeps the measured single-pass custom-conv path by default.
-        // M1 Max is vocoder-bound, so auto enables the MPS tap-GEMM backend only there.
-        if (device_name_contains("M1 Max")) {
+        // Enable the measured MPS tap-GEMM backend on M1 Max and M3 Ultra.
+        // M3 Ultra P0 improved end-to-end latency and passed listening review.
+        if (device_name_contains("M1 Max") || device_name_contains("M3 Ultra")) {
             return true;
         }
         return false;

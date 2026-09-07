@@ -2459,6 +2459,17 @@ std::vector<float> run_cfm_euler_metal_single_pass(
     // All subsequent allocations are scratch — reset per-block to reuse memory.
     metal.passSetScratchBase();
 
+    // Conditioning is fixed for this trajectory. Keep its projection in the
+    // persistent region and reuse it at every Euler step without recomputing.
+    {
+        auto cp_w = tensor_for_resident(metal, bundle, "s2mel.net.cfm.estimator.cond_projection.weight");
+        auto cp_b = tensor_for_resident(metal, bundle, "s2mel.net.cfm.estimator.cond_projection.bias");
+        metal.linear_rows_f32_pass_into(
+            "s2mel.net.cfm.estimator.cond_projection.weight.resident", cp_w,
+            "s2mel.net.cfm.estimator.cond_projection.bias.resident", cp_b,
+            cond_slot, rows, 512, 512, cond_proj_slot);
+    }
+
     const float dt = 1.0f / static_cast<float>(steps);
     for (uint32_t step = 0; step < steps; ++step) {
     const mit2::PassSlot t1_slot = t1_all_slot.slice(step * 512, 512);
@@ -2468,17 +2479,9 @@ std::vector<float> run_cfm_euler_metal_single_pass(
     metal.copy_f32_pass_into(x_cur_slot, x_mel_slot.slice(tokens * 80, tokens * 80), tokens * 80);
 
     // ----------------------------------------------------------------
-    // Input merge: cond_projection → dit_input_merge → cond_x_merge_linear
+    // Input merge: cached cond_projection → dit_input_merge → cond_x_merge_linear
     // ----------------------------------------------------------------
     {
-        auto cp_w = tensor_for_resident(metal, bundle, "s2mel.net.cfm.estimator.cond_projection.weight");
-        auto cp_b = tensor_for_resident(metal, bundle, "s2mel.net.cfm.estimator.cond_projection.bias");
-        metal.linear_rows_f32_pass_into(
-            "s2mel.net.cfm.estimator.cond_projection.weight.resident", cp_w,
-            "s2mel.net.cfm.estimator.cond_projection.bias.resident", cp_b,
-            cond_slot, rows, 512, 512, cond_proj_slot);
-        // cond_proj_slot is persistent; scratch still empty — no reset needed yet.
-
         auto merged_tmp = metal.dit_input_merge_batched_f32_pass(
             x_mel_slot, px_slot, cond_proj_slot, style_slot, batch, tokens);
 

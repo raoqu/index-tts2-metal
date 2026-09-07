@@ -1087,6 +1087,13 @@ HotWavMetrics synthesize_hot_condition_vectors_wav_shared(mit2::MetalContext& me
     const size_t generated_offset = static_cast<size_t>(prompt_tokens) * mel_dim;
     std::copy(full_mel.begin() + generated_offset, full_mel.end(), generated_mel.begin());
     auto wave = run_bigvgan_vocoder_metal(metal, bundle, generated_mel, generated_tokens);
+    // Optional pre-PCM artifacts for backend A/B validation. Keep this off in
+    // production and timing-only runs so file writes do not affect latency.
+    const char* dump_audio_tensors = std::getenv("MIT2_TTS_DUMP_AUDIO_TENSORS");
+    if (dump_audio_tensors && std::strcmp(dump_audio_tensors, "1") == 0) {
+        write_raw_f32(output_wav + ".mel.f32", generated_mel);
+        write_raw_f32(output_wav + ".waveform.f32", wave);
+    }
     write_wav_pcm16(output_wav, wave, sample_rate);
     float peak_abs = 0.0f;
     for (float sample : wave) {

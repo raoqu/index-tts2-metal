@@ -2,7 +2,7 @@
 
 日期：2026-09-07
 
-状态：P0、P1 用户听感验证通过，P0 的跨后端数值门槛未通过记录保留。P2 已实现，采样与音频一致性通过，但未证明提速，作为默认关闭的实验路径等待用户试听；P3 尚未开始。
+状态：P0–P2 用户听感验证通过，P0 的跨后端数值门槛未通过记录保留。P2、P3 均未证明稳定提速，实验路径默认关闭；P3 已完成逐位一致和性能验证，等待用户试听。
 
 执行规则（用户要求）：分步执行，每一步用同一句话、同一音色、相同参数生成优化前后两段音频；必须等用户听感判定后再进入下一步。听感结论与数值精度结论分别记录。
 
@@ -185,8 +185,8 @@ GPU 基准顺序运行，避免多个实验竞争 GPU。
 - [x] 从当前源码构建 Release 并建立可追溯基线。
 - [ ] P0：完成 BigVGAN 真实输入精度验证和后端选择评估。
 - [x] P1：实现 CFM 条件投影外提并验证本句逐位一致；用户听感验证通过。
-- [x] P2：实现保留 CPU 采样的 ICB 路径并验证确定性；未通过性能验收，默认关闭，等待用户试听。
-- [ ] P3：完成 LayerNorm/GEMV 微基准，决定是否实施。
+- [x] P2：实现保留 CPU 采样的 ICB 路径并验证确定性；用户听感通过，但未通过性能验收，默认关闭。
+- [x] P3：完成 LayerNorm/GEMV 拆分实验、逐步采样对比及完整解码性能验证；无性能收益，默认关闭，等待用户试听。
 - [ ] 完成组合优化的端到端精度、性能与内存回归。
 
 ## 11. P0 首轮执行记录：用户听感通过，数值门槛未通过
@@ -332,7 +332,7 @@ B 的请求墙钟中位数约慢 1.40%，GPT 阶段约慢 1.81%。上述多次�
 
 **判定：P2 精度通过，但当前 M3 Ultra 上未证明稳定提速，不能作为有效加速默认启用。CPU 采样仍要求逐 token 同步，提交数没有减少。保留可选实验实现，默认走原采样 pass；不放宽精度、不改变采样方法来追求速度。** 尚未独立拆出 CPU 编码/采样耗时，因此不把上述总耗时差异全部归因于某个 CPU 环节。
 
-P2 停在用户试听环节；确认后再执行 P3。
+用户随后反馈 **“通过，继续”**，P2 听感通过，据此执行 P3。P2 未通过性能验收的结论不变，正常采样仍使用原 pass。
 
 ### 产物
 
@@ -347,3 +347,67 @@ P2 停在用户试听环节；确认后再执行 P3。
 - [热请求基准脚本](../artifacts/tts-optimization/p2/bench_warm.py)
 
 目录保留性能测试时的候选二进制 `mtts_after`，以及最终默认关闭版本 `mtts_final`；源码差异保存为 `source.patch`。复现脚本会覆盖同名产物。
+
+## 14. P3 执行记录：输出一致，两种路径均未提速，默认关闭
+
+基线 revision：`cd2f4a1`（包含 P2 的可选 ICB 路径）。本轮只评估 LayerNorm/GEMV 拆分，不改变采样、CFM、prompt 或分段。
+
+### 实现
+
+- 新增 `mit2_gpt_layernorm_256_f32`，严格沿用原融合 kernel 的 256 线程归约、求和顺序、方差计算、float32 仿射变换。
+- QKV 和 FFN 扩展投影的输入各归一化一次，将结果写入 float32 workspace，再交给原有 GEMV、GELU 和 residual 运算。
+- 同时支持 pass 和 ICB；不使用现有 1024 线程通用 LayerNorm 代替原计算顺序。
+- 切换拆分模式时使 ICB 失效，重录相应图；仅在启用拆分时增加所需 workspace 和 48 个 ICB command 容量。
+- 每 token 的 24 层共增加 48 次独立归一化 dispatch。重复计算减少，但提交图中的 dispatch 和中间读写增加。
+- 默认关闭，通过 `MIT2_GPT_SPLIT_LAYERNORM=1` 显式启用；设为 `0` 保留原融合实现。
+
+### 精度验证
+
+新增测试入口：
+
+```bash
+MIT2_GPT_SAMPLED_ICB=1 ./build/mtts --test-gpt-split-layernorm-parity \
+  bin \
+  artifacts/tts-optimization/p2/before.wav.conds.f32 \
+  artifacts/tts-optimization/p2/before.wav.text_ids.u32
+```
+
+该测试在同一 context 中切换拆分模式，复用 P2 的测试夹具：3 个 seed、4 组采样配置、16/32/48/64 个 token、完整/较短文本前缀、两种位置编码模式、KV 增长及 greedy/sampling 切换。分别比较 pass 和 ICB；每步原始 logits、处理后 logits、codes 和停止位置全部一致，4 组测试通过。
+
+同句音频继续使用“琴”音色、16 步 CFM 及原采样参数：
+
+- 两条主对比路径均启用已通过听感的 BigVGAN 备用后端。
+- 两者均关闭 P2 sampling ICB，只改变 P3 拆分开关。
+- text IDs、codes、condition、noise、mel、float32 waveform 以及 WAV 文件逐位一致。
+- 两条路径各自的冷、热音频一致，输出仍为 6.48998 秒。
+- WAV SHA-256 仍为 `2bab7ba8353eb2ec2b6549e714d17899b4072ab072dc79b3f840c6b1a0dbd7eb`，与已接受的 P0 B、P1、P2 相同。
+
+### 性能验证
+
+使用完整 TTS 请求内的 GPT 阶段计时及请求墙钟时间，避免仅凭孤立归一化算子的计算量判断收益。各进程先预热一次，再测量 4 次；关闭诊断张量导出，顺序为 B→A。
+
+| 执行路径 | A：原融合实现，墙钟中位数 | B：拆分实现，墙钟中位数 | A GPT 中位数 | B GPT 中位数 |
+| --- | ---: | ---: | ---: | ---: |
+| 正常 sampling pass | 3.813110 秒 | 3.854985 秒 | 1.985305 秒 | 2.027855 秒 |
+| 实验 sampling ICB | 3.752255 秒 | 3.800490 秒 | 1.937100 秒 | 1.992110 秒 |
+
+正常 pass 墙钟约慢 1.10%，ICB 墙钟约慢 1.29%。两组补测的所有 WAV 均与主对比基线逐位一致。不能跨这两组运行直接判定 ICB 优于 pass；它们用于各自组内比较拆分开关。
+
+**判定：P3 已验证本句精度等价，但未证明性能收益。新增 dispatch 和中间存取使减少重复计算没有转化为完整解码提速。保留默认关闭的实验入口，继续使用原融合实现；不通过降低归约精度或放宽采样一致性追求速度。** 尚未独立分离每个 kernel 的时间，因此不把整个耗时差归因于某一个算子。
+
+Release 构建及 `git diff --check` 通过。P3 等待用户试听；在该判定之前，不进行后续组合配置变更。
+
+### 产物
+
+- [A：P3 优化前音频](../artifacts/tts-optimization/p3/before.wav)
+- [B：P3 拆分候选音频](../artifacts/tts-optimization/p3/after.wav)
+- [逐步 logits 和采样对比](../artifacts/tts-optimization/p3/ln_parity.json)
+- [整句精度及资源指标](../artifacts/tts-optimization/p3/metrics.json)
+- [正常 sampling pass 热请求基准](../artifacts/tts-optimization/p3/warm_benchmark.json)
+- [ICB 路径热请求基准](../artifacts/tts-optimization/p3/icb/warm_benchmark.json)
+- [配置及二进制哈希](../artifacts/tts-optimization/p3/metadata.json)
+- [音频复现脚本](../artifacts/tts-optimization/p3/run_comparison.py)
+- [pass 基准脚本](../artifacts/tts-optimization/p3/bench_warm.py)
+- [ICB 基准脚本](../artifacts/tts-optimization/p3/icb/bench_warm.py)
+
+同目录保存测试二进制 `mtts_after` 和源码差异 `source.patch`；复现脚本会覆盖同名产物。

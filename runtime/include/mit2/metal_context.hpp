@@ -247,6 +247,8 @@ public:
     // step) live in a GPU state buffer. Greedy advances it on GPU; CPU sampling
     // updates it before each single-token replay and reads back only logits.
     // ------------------------------------------------------------------
+    bool gptSplitLayerNormEnabled() const;
+    void setGptSplitLayerNorm(bool enabled);
     bool gptIcbAvailable(bool cpu_sampling = false) const;
     void gptIcbInvalidate();
     void gptIcbBeginRecord(uint32_t max_commands, size_t ws_bytes, uint32_t max_history);

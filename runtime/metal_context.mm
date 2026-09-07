@@ -146,6 +146,7 @@ struct MetalContext::Impl {
     id<MTLComputePipelineState> gpt_causal_attention_pipeline = nil;
     id<MTLComputePipelineState> linear_gemv_f16w_pipeline = nil;
     id<MTLComputePipelineState> gpt_fused_gemv_f16w_pipeline = nil;
+    id<MTLComputePipelineState> gpt_layernorm_256_pipeline = nil;
     id<MTLComputePipelineState> gpt_kv_store_pipeline = nil;
     id<MTLComputePipelineState> gpt_argmax_pipeline = nil;
     id<MTLComputePipelineState> gpt_build_current_pipeline = nil;
@@ -169,6 +170,7 @@ struct MetalContext::Impl {
     bool gpt_icb_recording = false;
     bool gpt_icb_ready = false;
     bool gpt_icb_cpu_sampling = false;
+    bool gpt_split_layernorm = false;
     NSUInteger gpt_icb_token_off = 0;
     NSUInteger gpt_icb_logits_off = 0;
     std::vector<id<MTLResource>> gpt_icb_read_resources;
@@ -738,6 +740,7 @@ static id<MTLComputePipelineState> make_pipeline(id<MTLDevice> device, id<MTLLib
 }
 
 MetalContext::MetalContext() : impl_(new Impl()) {
+    parse_env_bool_override("MIT2_GPT_SPLIT_LAYERNORM", impl_->gpt_split_layernorm);
     @autoreleasepool {
         impl_->device = MTLCreateSystemDefaultDevice();
         if (!impl_->device) {
@@ -772,6 +775,7 @@ MetalContext::MetalContext() : impl_(new Impl()) {
         impl_->embedding_pipeline = make_pipeline(impl_->device, impl_->library, @"mit2_embedding_f32");
         impl_->semantic_quantize_pipeline = make_pipeline(impl_->device, impl_->library, @"mit2_semantic_quantize_f32");
         impl_->layernorm_pipeline = make_pipeline(impl_->device, impl_->library, @"mit2_layernorm_f32_one_row");
+        impl_->gpt_layernorm_256_pipeline = make_pipeline(impl_->device, impl_->library, @"mit2_gpt_layernorm_256_f32");
         impl_->layernorm_rows_pipeline = make_pipeline(impl_->device, impl_->library, @"mit2_layernorm_f32_rows");
         impl_->layernorm_rows_serial_pipeline = make_pipeline(impl_->device, impl_->library, @"mit2_layernorm_f32_rows_serial");
         impl_->adaptive_layernorm_rows_pipeline = make_pipeline(impl_->device, impl_->library, @"mit2_adaptive_layernorm_f32_rows");
@@ -5341,6 +5345,17 @@ std::vector<float> MetalContext::gpt_causal_attention_f32(const std::vector<floa
     }
 }
 
+bool MetalContext::gptSplitLayerNormEnabled() const {
+    return impl_->gpt_split_layernorm;
+}
+
+void MetalContext::setGptSplitLayerNorm(bool enabled) {
+    if (impl_->gpt_split_layernorm != enabled) {
+        impl_->gpt_split_layernorm = enabled;
+        gptIcbInvalidate();  // recorded dispatches and workspace slots differ
+    }
+}
+
 bool MetalContext::gptIcbAvailable(bool cpu_sampling) const {
     return impl_->gpt_icb_ready && impl_->gpt_icb_cpu_sampling == cpu_sampling;
 }
@@ -5432,6 +5447,22 @@ PassSlot MetalContext::gptIcb_fused_gemv_f16w(const std::string& wk, const std::
     im->icb_track_read(bbuf);
     im->icb_track_read(gbuf);
     im->icb_track_read(bebuf);
+    if (has_ln && im->gpt_split_layernorm) {
+        auto normalized = im->icb_alloc_raw(cols);
+        auto norm_cmd = im->icb_next_command();
+        [norm_cmd setComputePipelineState:im->gpt_layernorm_256_pipeline];
+        [norm_cmd setKernelBuffer:im->gpt_icb_ws offset:x.byte_offset atIndex:0];
+        [norm_cmd setKernelBuffer:gbuf offset:0 atIndex:1];
+        [norm_cmd setKernelBuffer:bebuf offset:0 atIndex:2];
+        [norm_cmd setKernelBuffer:im->gpt_icb_ws offset:normalized.byte_offset atIndex:3];
+        [norm_cmd setKernelBuffer:im->icb_const_u32(cols) offset:0 atIndex:4];
+        [norm_cmd setKernelBuffer:im->icb_const_f32(eps) offset:0 atIndex:5];
+        [norm_cmd setBarrier];
+        [norm_cmd concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        x = normalized;
+        has_ln = false;
+    }
     auto out = im->icb_alloc_raw(rows);
     const uint32_t flags = (has_ln ? 1u : 0u) | (fuse_gelu ? 2u : 0u) | (has_residual ? 4u : 0u);
     const NSUInteger res_off = has_residual ? residual.byte_offset : x.byte_offset;
@@ -5698,6 +5729,20 @@ PassSlot MetalContext::gpt_fused_gemv_f16w_pass(const std::string& wk, const std
     id<MTLBuffer> bebuf = has_ln
         ? impl_->resident_buffer_with_bytes(bek, be.data(), be.size() * sizeof(float))
         : bbuf;
+    if (has_ln && impl_->gpt_split_layernorm) {
+        auto normalized = impl_->pass_alloc_raw(cols);
+        [impl_->pass_enc setComputePipelineState:impl_->gpt_layernorm_256_pipeline];
+        [impl_->pass_enc setBuffer:impl_->pass_workspace offset:x.byte_offset atIndex:0];
+        [impl_->pass_enc setBuffer:gbuf offset:0 atIndex:1];
+        [impl_->pass_enc setBuffer:bebuf offset:0 atIndex:2];
+        [impl_->pass_enc setBuffer:impl_->pass_workspace offset:normalized.byte_offset atIndex:3];
+        [impl_->pass_enc setBytes:&cols length:sizeof(cols) atIndex:4];
+        [impl_->pass_enc setBytes:&eps length:sizeof(eps) atIndex:5];
+        [impl_->pass_enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        x = normalized;
+        has_ln = false;
+    }
     auto out = impl_->pass_alloc_raw(rows);
     const uint32_t flags = (has_ln ? 1u : 0u) | (fuse_gelu ? 2u : 0u) | (has_residual ? 4u : 0u);
     const NSUInteger res_off = has_residual ? residual.byte_offset : x.byte_offset;

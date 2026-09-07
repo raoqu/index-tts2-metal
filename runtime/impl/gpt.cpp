@@ -1955,10 +1955,12 @@ GptGreedyOutputs run_gpt_kv_greedy_metal(mit2::MetalContext& metal,
     //                    + ln2(w) + c_fc(4w) + gelu(4w) + mlp_proj(w) + next_current(w).
     constexpr uint32_t per_layer_static_floats = qkv_width + 7 * width + 2 * mlp_width;  // 23040
     // +64 floats per allocation for the 256-byte slot alignment (10 allocs/layer + tail).
+    const size_t split_ln_floats = metal.gptSplitLayerNormEnabled()
+        ? static_cast<size_t>(n_layers) * 2 * (width + 64) : 0;
     const size_t workspace_bytes =
         (static_cast<size_t>(width) +
          static_cast<size_t>(n_layers) * (per_layer_static_floats + 10 * 64) +
-         2 * width + vocab + 8 * 64 + 1024) * sizeof(float);
+         2 * width + vocab + 8 * 64 + 1024 + split_ln_floats) * sizeof(float);
 
     static const bool gpt_icb_enabled = []() {
         const char* v = std::getenv("MIT2_GPT_ICB");
@@ -1983,8 +1985,8 @@ GptGreedyOutputs run_gpt_kv_greedy_metal(mit2::MetalContext& metal,
             const size_t icb_ws_bytes =
                 (static_cast<size_t>(1 + width) +
                  static_cast<size_t>(n_layers) * (qkv_width + width + width + mlp_width + width) +
-                 2 * width + vocab + 140 * 64) * sizeof(float);
-            metal.gptIcbBeginRecord(132, icb_ws_bytes, 4096);
+                 2 * width + vocab + 140 * 64 + split_ln_floats) * sizeof(float);
+            metal.gptIcbBeginRecord(132 + (metal.gptSplitLayerNormEnabled() ? 48 : 0), icb_ws_bytes, 4096);
             auto token_slot = metal.gptIcbAlloc(1);
             auto current = metal.gptIcb_build_current(
                 token_slot,
@@ -2276,7 +2278,8 @@ GptGreedyOutputs run_gpt_kv_greedy_metal(mit2::MetalContext& metal,
 // Reuse one context across mode changes and KV growth to catch stale ICB bindings.
 bool run_gpt_sampled_icb_parity_test(const std::string& bundle_dir,
                                      const std::string& conds_path,
-                                     const std::string& text_ids_path) {
+                                     const std::string& text_ids_path,
+                                     bool split_layernorm_test = false) {
     mit2::Bundle bundle(bundle_dir);
     mit2::MetalContext metal;
     const auto conds = read_raw_f32(conds_path);
@@ -2288,8 +2291,11 @@ bool run_gpt_sampled_icb_parity_test(const std::string& bundle_dir,
         return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
     };
     bool all_ok = true;
-    std::cout << "{\n  \"stage\": \"gpt_sampled_icb_parity\",\n  \"cases\": [\n";
+    if (split_layernorm_test) metal.setGptSplitLayerNorm(false);
+    std::cout << "{\n  \"stage\": \"" << (split_layernorm_test ? "gpt_split_layernorm_parity" : "gpt_sampled_icb_parity") << "\",\n  \"cases\": [\n";
     for (uint32_t i = 0; i < 4; ++i) {
+        if (split_layernorm_test) metal.setGptSplitLayerNorm(false);
+        const bool use_case_icb = !split_layernorm_test || i % 2 != 0;
         const uint32_t steps = 16 + i * 16;
         const std::vector<uint32_t> case_ids(text_ids.begin(),
             text_ids.begin() + (i % 2 ? text_ids.size() / 2 : text_ids.size()));
@@ -2312,14 +2318,15 @@ bool run_gpt_sampled_icb_parity_test(const std::string& bundle_dir,
         std::vector<float> ref_logits, got_logits, ref_processed, got_processed;
         auto ref = run_gpt_kv_greedy_metal(metal, bundle, prefix.inputs_embeds,
                                            prefix_tokens, steps, hf_positions, &sampling, &history,
-                                           false, &ref_logits, &ref_processed);
+                                           split_layernorm_test && use_case_icb, &ref_logits, &ref_processed);
+        if (split_layernorm_test) metal.setGptSplitLayerNorm(true);
         auto got = run_gpt_kv_greedy_metal(metal, bundle, prefix.inputs_embeds,
                                            prefix_tokens, steps, hf_positions, &sampling, &history,
-                                           true, &got_logits, &got_processed);
-        const bool sampled_graph = metal.gptIcbAvailable(true);
+                                           use_case_icb, &got_logits, &got_processed);
+        const bool sampled_graph = !use_case_icb || metal.gptIcbAvailable(true);
         // The next sampling request reuses the already-recorded graph.
         auto repeat = run_gpt_kv_greedy_metal(metal, bundle, prefix.inputs_embeds,
-                                              prefix_tokens, steps, hf_positions, &sampling, &history);
+                                              prefix_tokens, steps, hf_positions, &sampling, &history, use_case_icb);
         auto greedy_after = run_gpt_kv_greedy_metal(metal, bundle, prefix.inputs_embeds,
                                                     prefix_tokens, 4, true);
         const bool logits_ok = exact(ref_logits, got_logits) &&

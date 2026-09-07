@@ -1119,6 +1119,68 @@ kernel void mit2_linear_gemv_f16w_f32(
     }
 }
 
+// Standalone version of the fused decode kernel's LayerNorm. Dispatch exactly
+// 256 threads so every sum, variance and affine operation keeps the same order.
+kernel void mit2_gpt_layernorm_256_f32(
+    device const float* x [[buffer(0)]],
+    device const float* ln_gamma [[buffer(1)]],
+    device const float* ln_beta [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint3 tg_size [[threads_per_threadgroup]]
+) {
+    const uint tid = tid3.x;
+    threadgroup float red[8];
+    threadgroup float bcast2[2];
+    // Match the fused kernel reduction, then write normalized values to device memory.
+    float lsum = 0.0f;
+    for (uint i = tid; i < cols; i += tg_size.x) {
+        lsum += x[i];
+    }
+    float ssum = simd_sum(lsum);
+    if (lane == 0) {
+        red[sg] = ssum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < tg_size.x / 32; ++i) {
+            total += red[i];
+        }
+        bcast2[0] = total / float(cols);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = bcast2[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lvar = 0.0f;
+    for (uint i = tid; i < cols; i += tg_size.x) {
+        const float d = x[i] - mean;
+        lvar += d * d;
+    }
+    float svar = simd_sum(lvar);
+    if (lane == 0) {
+        red[sg] = svar;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < tg_size.x / 32; ++i) {
+            total += red[i];
+        }
+        bcast2[1] = rsqrt(total / float(cols) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_std = bcast2[1];
+    for (uint i = tid; i < cols; i += tg_size.x) {
+        out[i] = (x[i] - mean) * inv_std * ln_gamma[i] + ln_beta[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 // Fused single-row GPT op: optional LayerNorm(x) -> GEMV(half weights) ->
 // optional GELU -> optional residual add. Collapses ln+linear+gelu+add chains
 // (10 dispatches/layer -> 5) for the bandwidth-bound decode loop.
